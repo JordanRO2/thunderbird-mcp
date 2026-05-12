@@ -61,11 +61,12 @@ function getExtVersion() {
 const _attachTimers = new Set();
 // Track temp files created for inline base64 attachments (cleaned up on shutdown).
 const _tempAttachFiles = new Set();
-// Track compose windows already claimed by an in-flight replyToMessage call,
-// so concurrent replies to the same original message never bind two observers
-// to the same compose window (which would double-inject the body/attachments).
+// Track compose windows already claimed by an in-flight replyToMessage or
+// forwardMessage call, so concurrent reply/forward operations on the same
+// original message never bind two observers to the same compose window
+// (which would double-inject the body/attachments).
 // WeakSet so entries are collected automatically when the window is destroyed.
-const _claimedReplyComposeWindows = new WeakSet();
+const _claimedComposeWindows = new WeakSet();
 const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
 // Must be large enough to carry MAX_BASE64_SIZE plus JSON-RPC framing overhead.
 // The httpd.sys.mjs pre-buffer cap uses the same value.
@@ -1583,7 +1584,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function openReplyComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs) {
+            function openComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs) {
               return new Promise((resolve) => {
                 const OPEN_TIMEOUT_MS = 15000;
                 let settled = false;
@@ -1625,8 +1626,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // both observers see both compose windows. Skip any window
                     // that has already been claimed by a prior observer so each
                     // call binds to exactly one compose window.
-                    if (_claimedReplyComposeWindows.has(composeWin)) return;
-                    _claimedReplyComposeWindows.add(composeWin);
+                    if (_claimedComposeWindows.has(composeWin)) return;
+                    _claimedComposeWindows.add(composeWin);
 
                     matchedWindow = composeWin;
                     try { Services.ww.unregisterNotification(windowObserver); } catch {}
@@ -3957,7 +3958,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
-                msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+                // Respect the user's compose-format preference unless the caller
+                // explicitly forced HTML via isHtml: true.
+                msgComposeParams.format = isHtml === true ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.Default;
                 msgComposeParams.composeFields = composeFields;
 
                 const identityResult = setComposeIdentity(msgComposeParams, from, null);
@@ -4024,7 +4027,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    .createInstance(Ci.nsIMsgCompFields);
 
 	                  msgComposeParams.type = compType;
-	                  msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+	                  // Respect the user's compose-format preference unless the caller
+	                  // explicitly forced HTML via isHtml: true.
+	                  msgComposeParams.format = isHtml === true ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.Default;
 	                  msgComposeParams.originalMsgURI = msgURI;
 	                  msgComposeParams.composeFields = composeFields;
 
@@ -4112,7 +4117,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    return;
 	                  }
 
-	                  openReplyComposeWindowWithCustomizations(
+	                  openComposeWindowWithCustomizations(
 	                    msgComposeParams,
 	                    msgURI,
 	                    compType,
@@ -4139,118 +4144,160 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Forwards a message with original content and attachments. Opens a
-             * compose window for review, or sends directly when skipReview is true.
-             * Uses New type with manual forward quote to preserve both intro body and forwarded content.
+             * Forwards a message with original content and attachments.
+             *
+             * Review path uses Thunderbird's native ForwardInline compose flow so
+             * TB builds the forward body with a proper <blockquote type="cite">
+             * quote, auto-attaches the original message's attachments, places the
+             * identity signature per user preferences, and sets the $Forwarded
+             * disposition on the original after a successful send. The caller's
+             * intro body is injected via NotifyComposeBodyReady, mirroring how
+             * replyToMessage handles intro injection.
+             *
+             * skipReview still uses direct send, so it keeps a manual forward
+             * block + auto-attaches originals from MsgHdrToMimeMessage + manually
+             * marks the original as forwarded after a successful send.
              */
-	            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
-	              return new Promise((resolve) => {
-	                try {
-	                  if (skipReview && isSkipReviewBlocked()) {
-	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
-	                    return;
-	                  }
-	                  const found = findMessage(messageId, folderPath);
-	                  if (found.error) {
-	                    resolve({ error: found.error });
-	                    return;
-	                  }
-	                  const { msgHdr, folder } = found;
+            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
+              return new Promise((resolve) => {
+                try {
+                  if (skipReview && isSkipReviewBlocked()) {
+                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
+                    return;
+                  }
+                  const found = findMessage(messageId, folderPath);
+                  if (found.error) {
+                    resolve({ error: found.error });
+                    return;
+                  }
+                  const { msgHdr, folder } = found;
+                  const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
+                  const msgURI = folder.getUriForMsg(msgHdr);
+                  const compType = Ci.nsIMsgCompType.ForwardInline;
 
-	                  // Get attachments and body from original message
-	                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-	                    "resource:///modules/gloda/MimeMessage.sys.mjs"
-                  );
+                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
+                    .createInstance(Ci.nsIMsgComposeParams);
 
-                  MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
-                    try {
-                      const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
-                        .createInstance(Ci.nsIMsgComposeParams);
+                  const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
+                    .createInstance(Ci.nsIMsgCompFields);
 
-                      const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
-                        .createInstance(Ci.nsIMsgCompFields);
+                  msgComposeParams.type = compType;
+                  // Respect the user's compose-format preference unless the caller
+                  // explicitly forced HTML via isHtml: true.
+                  msgComposeParams.format = isHtml === true ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.Default;
+                  msgComposeParams.originalMsgURI = msgURI;
+                  msgComposeParams.composeFields = composeFields;
 
-                      composeFields.to = to;
-                      composeFields.cc = cc || "";
-                      composeFields.bcc = bcc || "";
+                  try {
+                    msgComposeParams.origMsgHdr = msgHdr;
+                  } catch {}
 
-                      const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-                      composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
+                  const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
+                  if (identityResult && identityResult.error) {
+                    resolve(identityResult);
+                    return;
+                  }
 
-                      // Get original body
-                      const originalBody = extractPlainTextBody(aMimeMsg);
+                  if (skipReview) {
+                    const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+                      "resource:///modules/gloda/MimeMessage.sys.mjs"
+                    );
 
-                      // Build forward header block
-                      const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
-                      const fwdAuthor = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-                      const fwdSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-                      const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
-                      const escapedBody = escapeHtml(originalBody).replace(/\n/g, '<br>');
+                    MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
+                      try {
+                        const originalBody = extractPlainTextBody(aMimeMsg);
 
-                      const forwardBlock = `-------- Forwarded Message --------<br>` +
-                        `Subject: ${escapeHtml(fwdSubject)}<br>` +
-                        `Date: ${dateStr}<br>` +
-                        `From: ${escapeHtml(fwdAuthor)}<br>` +
-                        `To: ${escapeHtml(fwdRecipients)}<br><br>` +
-                        escapedBody;
+                        composeFields.to = to;
+                        composeFields.cc = cc || "";
+                        composeFields.bcc = bcc || "";
 
-                      // Combine intro body + forward block
-                      const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
+                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                        composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
 
-                      composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
+                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
+                        const fwdAuthor = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
+                        const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
 
-                      // Collect original message attachments as descriptors
-                      const origDescs = [];
-                      if (aMimeMsg && aMimeMsg.allUserAttachments) {
-                        for (const att of aMimeMsg.allUserAttachments) {
-                          try {
-                            origDescs.push({ url: att.url, name: att.name, contentType: att.contentType });
-                          } catch {
-                            // Skip unreadable original attachments
+                        const fwdHeaderHtml =
+                          `-------- Forwarded Message --------<br>` +
+                          `Subject: ${escapeHtml(origSubject)}<br>` +
+                          `Date: ${dateStr}<br>` +
+                          `From: ${escapeHtml(fwdAuthor)}<br>` +
+                          `To: ${escapeHtml(fwdRecipients)}<br><br>`;
+                        const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
+                        const quotedLines = originalBody.split('\n').map(line =>
+                          `&gt; ${escapeHtml(line)}`
+                        ).join('<br>');
+
+                        // Direct send goes through nsIMsgSend, not nsIMsgCompose, so
+                        // we still hand-build the forward block. Mirror the reply
+                        // path's HTML/plain shape: when isHtml is true, wrap the
+                        // forwarded content in <blockquote type="cite"> to match
+                        // native TB rendering; otherwise emit the text-divider form.
+                        const forwardBlock = isHtml
+                          ? `<blockquote type="cite">${fwdHeaderHtml}${quotedHtml}</blockquote>`
+                          : `${fwdHeaderHtml}${quotedLines}`;
+                        const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
+
+                        composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
+
+                        const origDescs = [];
+                        if (aMimeMsg && aMimeMsg.allUserAttachments) {
+                          for (const att of aMimeMsg.allUserAttachments) {
+                            try {
+                              origDescs.push({ url: att.url, name: att.name, contentType: att.contentType });
+                            } catch {
+                              // Skip unreadable original attachments
+                            }
                           }
                         }
-                      }
+                        const allDescs = [...origDescs, ...fileDescs];
 
-                      // Validate user-specified file attachments
-                      const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
-
-                      // Use New type - we build forward quote manually
-                      msgComposeParams.type = Ci.nsIMsgCompType.New;
-                      msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
-                      msgComposeParams.composeFields = composeFields;
-
-                      const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
-                      if (identityResult && identityResult.error) { resolve(identityResult); return; }
-
-                      const allDescs = [...origDescs, ...fileDescs];
-
-                      if (skipReview) {
-                        const msgURI = folder.getUriForMsg(msgHdr);
-                        sendMessageDirectly(composeFields, msgComposeParams.identity, allDescs, msgURI, Ci.nsIMsgCompType.ForwardInline).then(result => {
+                        sendMessageDirectly(composeFields, msgComposeParams.identity, allDescs, msgURI, compType).then(result => {
                           if (result.success) {
+                            let forwardedDisposition = null;
+                            try {
+                              forwardedDisposition = Ci.nsIMsgFolder.nsMsgDispositionState_Forwarded;
+                            } catch {}
+                            markMessageDispositionState(msgHdr, forwardedDisposition);
+
                             let msg = `Forward sent with ${allDescs.length} attachment(s)`;
                             if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                             result.message = msg;
                           }
                           resolve(result);
                         });
-                        return;
+                      } catch (e) {
+                        resolve({ error: e.toString() });
                       }
+                    }, true, { examineEncryptedParts: true });
+                    return;
+                  }
 
-                      const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                        .getService(Ci.nsIMsgComposeService);
-                      msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-
-                      injectAttachmentsAsync(allDescs);
-
-                      let msg = `Forward window opened with ${allDescs.length} attachment(s)`;
+                  // Review path: TB builds the forward body and auto-attaches the
+                  // original's attachments via ForwardInline. The intro body and
+                  // user-specified extra attachments are injected once the compose
+                  // window's editor signals NotifyComposeBodyReady. Subject is set
+                  // by TB from origMsgHdr.
+                  openComposeWindowWithCustomizations(
+                    msgComposeParams,
+                    msgURI,
+                    compType,
+                    msgComposeParams.identity,
+                    body,
+                    isHtml,
+                    to,
+                    cc,
+                    bcc,
+                    fileDescs
+                  ).then(result => {
+                    if (result.success) {
+                      let msg = "Forward window opened";
                       if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-                      resolve({ success: true, message: msg });
-                    } catch (e) {
-                      resolve({ error: e.toString() });
+                      result.message = msg;
                     }
-                  }, true, { examineEncryptedParts: true });
-
+                    resolve(result);
+                  });
                 } catch (e) {
                   resolve({ error: e.toString() });
                 }
