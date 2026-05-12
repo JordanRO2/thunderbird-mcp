@@ -1598,6 +1598,72 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function moveComposeSelectionToBodyStartIfRange(composeWin) {
+              const browser = typeof composeWin?.getBrowser === "function" ? composeWin.getBrowser() : null;
+              const editorDoc = browser?.contentDocument;
+              const root = editorDoc?.body;
+              const selection = typeof editorDoc?.getSelection === "function" ? editorDoc.getSelection() : null;
+              let shouldMove = false;
+              let moveError = null;
+
+              if (selection) {
+                if (selection.isCollapsed) return true;
+                shouldMove = true;
+              }
+
+              if (shouldMove && root && typeof editorDoc.createRange === "function") {
+                try {
+                  const range = editorDoc.createRange();
+                  range.setStart(root, 0);
+                  range.collapse(true);
+                  selection.removeAllRanges();
+                  selection.addRange(range);
+                  return true;
+                } catch (e) {
+                  moveError = e;
+                }
+              }
+
+              const editor = typeof composeWin?.GetCurrentEditor === "function" ? composeWin.GetCurrentEditor() : null;
+              let editorSelection = null;
+              if (!selection && editor) {
+                try {
+                  editorSelection = editor.selection || null;
+                } catch (e) {
+                  moveError = e;
+                }
+              }
+
+              if (!selection && editorSelection) {
+                try {
+                  if (editorSelection.isCollapsed) return true;
+                  shouldMove = true;
+                } catch (e) {
+                  moveError = e;
+                }
+              }
+
+              if (!selection && !editorSelection) {
+                // Legacy editor-only path does not expose a reliable DOM
+                // selection, so anchor defensively before insertHTML.
+                shouldMove = true;
+              }
+
+              if (shouldMove && editor && typeof editor.beginningOfDocument === "function") {
+                try {
+                  editor.beginningOfDocument();
+                  return true;
+                } catch (e) {
+                  moveError = e;
+                }
+              }
+
+              if (shouldMove) {
+                console.warn("thunderbird-mcp: could not anchor compose body insertion; insertHTML may replace selected quote", moveError);
+              }
+              return !shouldMove;
+            }
+
             function insertReplyBodyIntoComposeWindow(composeWin, body, isHtml) {
               if (!composeWin || !body) return;
               const fragment = formatBodyFragmentHtml(body, isHtml);
@@ -1606,10 +1672,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const browser = typeof composeWin.getBrowser === "function" ? composeWin.getBrowser() : null;
               const editorDoc = browser?.contentDocument;
               if (editorDoc && typeof editorDoc.execCommand === "function") {
+                // Body-ready can leave the original quote selected. insertHTML
+                // replaces active ranges, so anchor only when TB selected text.
+                moveComposeSelectionToBodyStartIfRange(composeWin);
                 editorDoc.execCommand("insertHTML", false, fragment);
               } else {
                 const editor = typeof composeWin.GetCurrentEditor === "function" ? composeWin.GetCurrentEditor() : null;
                 if (editor && typeof editor.insertHTML === "function") {
+                  moveComposeSelectionToBodyStartIfRange(composeWin);
                   editor.insertHTML(fragment);
                 }
               }
