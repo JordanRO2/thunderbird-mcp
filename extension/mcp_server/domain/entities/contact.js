@@ -20,10 +20,16 @@ function matchesQuery(fields, lowerQuery) {
   const displayName = (fields.displayName || "").toLowerCase();
   const firstName = (fields.firstName || "").toLowerCase();
   const lastName = (fields.lastName || "").toLowerCase();
-  return email.includes(lowerQuery) ||
-    displayName.includes(lowerQuery) ||
-    firstName.includes(lowerQuery) ||
-    lastName.includes(lowerQuery);
+  const haystack = [email, displayName, firstName, lastName];
+
+  // Empty query matches all (existing behavior).
+  if (!lowerQuery) return true;
+  // Tokenize on whitespace/commas so CardDAV "Lastname, Firstname" displayNames
+  // match natural-order queries like "Firstname Lastname". A single-token query
+  // (incl. emails with "." and "@") behaves identically to the old substring match.
+  const tokens = lowerQuery.split(/[,\s]+/).filter(Boolean);
+  if (tokens.length === 0) return false; // whitespace/comma-only query matches nothing
+  return tokens.every(token => haystack.some(field => field.includes(token)));
 }
 
 /** Shape a single search hit. `fields` are plain values read off the card+book. */
