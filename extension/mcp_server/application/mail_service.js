@@ -56,6 +56,8 @@ module.exports = function register(ctx) {
     extractPlainTextBody,
     isSystemPrincipalFetchAllowed,
     wrapUntrustedPreview,
+    attachmentSaveLooksWrong,
+    parseAttachmentPartsFromRawMime,
     mailAdapter,
     messageEntity,
   } = ctx;
@@ -1053,6 +1055,144 @@ module.exports = function register(ctx) {
 
                     const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 
+                    let rawMimeAttachmentParts = null;
+                    let rawMimeAttachmentError = null;
+                    const _consumedRawMimeParts = new Set();
+
+                                        function getRawMimeAttachmentParts() {
+                                          if (rawMimeAttachmentParts) return { parts: rawMimeAttachmentParts };
+                                          if (rawMimeAttachmentError) return { error: rawMimeAttachmentError };
+                                          let rawStream = null;
+                                          try {
+                                            const rawFolder = msgHdr.folder;
+                                            rawStream = rawFolder.getMsgInputStream(msgHdr, {});
+                                            let rawSize = rawFolder.hasMsgOffline(msgHdr.messageKey)
+                                              ? msgHdr.offlineMessageSize
+                                              : msgHdr.messageSize;
+                                            if (!rawSize || rawSize <= 0) rawSize = rawStream.available();
+                                            if (!rawSize || rawSize <= 0) throw new Error("message stream has zero size");
+                                            if (rawSize > MAX_ATTACHMENT_BYTES) {
+                                              throw new Error(`raw MIME message too large (${rawSize} bytes, limit ${MAX_ATTACHMENT_BYTES})`);
+                                            }
+                                            const rawContent = NetUtil.readInputStreamToString(rawStream, rawSize);
+                                            rawMimeAttachmentParts = parseAttachmentPartsFromRawMime(rawContent);
+                                            return { parts: rawMimeAttachmentParts };
+                                          } catch (e) {
+                                            rawMimeAttachmentError = e;
+                                            return { error: e };
+                                          } finally {
+                                            if (rawStream) try { rawStream.close(); } catch {
+                                              // ignore close failure during best-effort fallback
+                                            }
+                                          }
+                                        }
+
+                                        function normalizeAttachmentFilename(name) {
+                                          return String(name || "").trim().toLowerCase();
+                                        }
+
+                                        function normalizeAttachmentContentType(contentType) {
+                                          return ((String(contentType || "").split(";")[0] || "").trim().toLowerCase());
+                                        }
+
+                                        function normalizeAttachmentContentId(contentId) {
+                                          return String(contentId || "").trim().replace(/^<|>$/g, "").toLowerCase();
+                                        }
+
+                                        function findRawMimeAttachmentPart(info, expectedSize) {
+                                          const parsed = getRawMimeAttachmentParts();
+                      if (parsed.error) return { error: parsed.error };
+                      const parts = parsed.parts || [];
+                      const availableParts = parts.filter(part => !_consumedRawMimeParts.has(part));
+                      const expectedName = normalizeAttachmentFilename(info?.name);
+                      const expectedType = normalizeAttachmentContentType(info?.contentType);
+                      const expectedCid = normalizeAttachmentContentId(info?.contentId || info?.contentID || info?.cid);
+
+                      let candidates = expectedName
+                        ? availableParts.filter(part => normalizeAttachmentFilename(part.filename) === expectedName)
+                        : [];
+                      if (candidates.length === 0 && expectedCid) {
+                        candidates = availableParts.filter(part => normalizeAttachmentContentId(part.contentId) === expectedCid);
+                      }
+                      if (candidates.length === 0 && expectedType) {
+                        candidates = availableParts.filter(part => normalizeAttachmentContentType(part.contentType) === expectedType);
+                      }
+                                          if (candidates.length === 0) return { part: null };
+
+                                          candidates.sort((a, b) => {
+                                            const aName = normalizeAttachmentFilename(a.filename) === expectedName ? 1 : 0;
+                                            const bName = normalizeAttachmentFilename(b.filename) === expectedName ? 1 : 0;
+                                            if (aName !== bName) return bName - aName;
+                                            const aType = normalizeAttachmentContentType(a.contentType) === expectedType ? 1 : 0;
+                                            const bType = normalizeAttachmentContentType(b.contentType) === expectedType ? 1 : 0;
+                                            if (aType !== bType) return bType - aType;
+                                            const aCid = normalizeAttachmentContentId(a.contentId) === expectedCid ? 1 : 0;
+                                            const bCid = normalizeAttachmentContentId(b.contentId) === expectedCid ? 1 : 0;
+                                            if (aCid !== bCid) return bCid - aCid;
+                                            if (typeof expectedSize === "number" && expectedSize > 0) {
+                                              const aDelta = Math.abs((a.bytes?.length || 0) - expectedSize);
+                                              const bDelta = Math.abs((b.bytes?.length || 0) - expectedSize);
+                                              if (aDelta !== bDelta) return aDelta - bDelta;
+                                            }
+                                            const aAttachment = a.disposition === "attachment" ? 1 : 0;
+                                            const bAttachment = b.disposition === "attachment" ? 1 : 0;
+                                            return bAttachment - aAttachment;
+                                          });
+                                          return { part: candidates[0] };
+                                        }
+
+                                        function writeBytesToFile(file, bytes) {
+                                          const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                                            .createInstance(Ci.nsIFileOutputStream);
+                                          ostream.init(file, 0x02 | 0x08 | 0x20, 0o600, 0);
+                                          const bstream = Cc["@mozilla.org/binaryoutputstream;1"]
+                                            .createInstance(Ci.nsIBinaryOutputStream);
+                                          try {
+                                            bstream.setOutputStream(ostream);
+                                            bstream.writeByteArray(bytes, bytes.length);
+                                          } finally {
+                                            try { bstream.close(); } catch {}
+                                            try { ostream.close(); } catch {}
+                                          }
+                                        }
+
+                                        function recoverAttachmentFromRawMime(info, expectedSize, file) {
+                                          const found = findRawMimeAttachmentPart(info, expectedSize);
+                                          if (found.error) {
+                                            return { error: `attachment body not recoverable from raw MIME: ${found.error}` };
+                                          }
+                                          if (!found.part) {
+                                            return { error: "attachment body not recoverable from raw MIME" };
+                                          }
+                                          const bytes = found.part.bytes;
+                                          if (!bytes || bytes.length === 0) {
+                                            return { error: "attachment body not recoverable from raw MIME" };
+                                          }
+                                          if (bytes.length > MAX_ATTACHMENT_BYTES) {
+                                            return { error: `Attachment too large (${bytes.length} bytes, limit ${MAX_ATTACHMENT_BYTES})` };
+                                          }
+                                          try {
+                                            writeBytesToFile(file, bytes);
+                                          } catch (e) {
+                                            return { error: `attachment raw MIME recovery write failed: ${e}` };
+                                          }
+                                          let recoveredSize = null;
+                                          try {
+                                            recoveredSize = file.fileSize;
+                                            if (recoveredSize > MAX_ATTACHMENT_BYTES) {
+                                              return { error: `Attachment too large (${recoveredSize} bytes, limit ${MAX_ATTACHMENT_BYTES})` };
+                                            }
+                                          } catch {
+                                            return { error: "attachment raw MIME recovery size check failed" };
+                                          }
+                      if (attachmentSaveLooksWrong(expectedSize, recoveredSize)) {
+                        const expectedText = typeof expectedSize === "number" ? `, expected ${expectedSize}` : "";
+                        return { error: `attachment body recovered from raw MIME but size mismatch (${recoveredSize} bytes${expectedText})` };
+                      }
+                      _consumedRawMimeParts.add(found.part);
+                      return { size: recoveredSize };
+                    }
+
                     const saveOne = ({ info, url, size }, index) =>
                       new Promise((done) => {
                         try {
@@ -1149,15 +1289,32 @@ module.exports = function register(ctx) {
                                     return;
                                   }
 
+                                  let actualSize = null;
                                   try {
-                                    if (file.fileSize > MAX_ATTACHMENT_BYTES) {
-                                      info.error = `Attachment too large (${file.fileSize} bytes, limit ${MAX_ATTACHMENT_BYTES})`;
+                                    actualSize = file.fileSize;
+                                    if (actualSize > MAX_ATTACHMENT_BYTES) {
+                                      info.error = `Attachment too large (${actualSize} bytes, limit ${MAX_ATTACHMENT_BYTES})`;
                                       try { file.remove(false); } catch {}
                                       done();
                                       return;
                                     }
                                   } catch {
-                                    // ignore fileSize failures
+                                    actualSize = null;
+                                  }
+
+                                  // multipart/alternative siblings: TB exposes the attachment via
+                                  // allUserAttachments but streams 0/short bytes from the part URL.
+                                  // Fall back to recovering the body from the raw MIME source.
+                                  if (attachmentSaveLooksWrong(knownSize, actualSize)) {
+                                    const recovered = recoverAttachmentFromRawMime(info, knownSize, file);
+                                    if (recovered.error) {
+                                      info.error = recovered.error;
+                                      delete info.filePath;
+                                      try { file.remove(false); } catch {}
+                                      done();
+                                      return;
+                                    }
+                                    actualSize = recovered.size;
                                   }
 
                                   info.filePath = file.path;

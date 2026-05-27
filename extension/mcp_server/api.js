@@ -151,6 +151,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       createRateLimiterState,
       consumeRateLimit,
       inspectRateLimits,
+      attachmentSaveLooksWrong,
+      parseAttachmentPartsFromRawMime,
     } = __helperScope.module.exports;
 
     // The rate-limiter STATE is now created and owned by
@@ -1203,7 +1205,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               summarizeAttachmentsForAudit, isSafeMarkdownHref, isSafeImageSrc,
               escapeMarkdownLinkText, renderMarkdownLink, isSystemPrincipalFetchAllowed,
               validateAgainstSchema, createRateLimiterState, consumeRateLimit,
-              inspectRateLimits,
+              inspectRateLimits, attachmentSaveLooksWrong, parseAttachmentPartsFromRawMime,
               // The tool METADATA registry (single source of truth; a structural
               // test parses this file for it, so it stays defined here).
               tools,
