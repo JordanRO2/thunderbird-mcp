@@ -1,51 +1,62 @@
-/**
- * Compose domain module for the Thunderbird MCP server.
- *
- * Implements the outgoing-mail and template tools: sendMail (composeMail),
- * replyToMessage, forwardMessage, saveDraft, dryRunCompose, listTemplates,
- * renderTemplate -- plus their internal helpers (identity lookup, attachment
- * descriptor building, compose-window customization, headless send, recipient
- * merging, body formatting, and template loading/parsing) and the
- * compose-related constants.
- *
- * Loaded by api.js via Services.scriptloader.loadSubScript with a
- * { module: { exports: {} } } scope, exactly like security_helpers.js and the
- * other domain modules. register(ctx) destructures the shared dependencies it
- * needs from ctx -- the XPCOM bindings (Cc/Ci/Services/MailServices), the
- * audit/idempotency/access-control infra helpers, the shared body and message
- * lookup helpers (extractPlainTextBody, findMessage) that MAIL also uses, the
- * shutdown-tracked temp-attachment / timer / claimed-window state objects that
- * also have to stay reachable from api.js's shutdown cleanup, and the
- * header/path sanitizers from security_helpers.js -- then defines the
- * functions verbatim and assigns the tool functions back onto ctx for the
- * dispatch switch.
- *
- * NOTE: function bodies are copied byte-for-byte from the monolithic api.js
- * (original indentation preserved) so runtime behavior is identical.
- */
 "use strict";
 
+/**
+ * infrastructure/compose_adapter.js — the ONLY place the compose domain touches
+ * XPCOM: MailServices, nsIMsgCompose / nsIMsgComposeParams / nsIMsgCompFields,
+ * nsIMsgSend (headless send), the compose-window observer/state-listener flow,
+ * nsIMsgAttachment building, base64-decode + temp-file writes for inline
+ * attachments, template-directory file I/O, identity lookup, and the DOM
+ * (DOMParser / editor) work that mutates a live compose window.
+ *
+ * Pure record/string shaping is delegated to domain/entities/compose.js
+ * (ctx.composeEntity). The application service (application/compose_service.js)
+ * calls these adapter methods and never sees a raw compose window or nsIFile.
+ *
+ * Behavior is preserved verbatim from the original domain/compose.js: every
+ * function body is copied byte-for-byte (original indentation preserved) so
+ * runtime behavior is identical.
+ *
+ * SHUTDOWN STATE: the three shutdown-tracked state objects (_attachTimers,
+ * _tempAttachFiles, _claimedComposeWindows) are consumed from ctx BY REFERENCE
+ * — they are owned/created by api.js's file scope and drained by its onShutdown
+ * cleanup, so we must read the SAME object instances off ctx, never re-create
+ * them. _tempFileCounter stays module-local here (it was a file-scope
+ * `let _tempFileCounter = 0` in the monolith and is only read/incremented when
+ * writing inline-attachment temp files), matching the original semantics: it
+ * persists for the life of the loaded module since register runs once at start.
+ *
+ * Consumes from ctx:
+ *   Cc, Ci, Services, MailServices, AUDIT_LOG_SUBDIR,
+ *   isAccountAllowed, getAccessibleAccounts,
+ *   isSensitiveFilePath, composeEntity,
+ *   _attachTimers, _tempAttachFiles, _claimedComposeWindows
+ *   (ChromeUtils / Components / DOMParser / atob are ambient subscript globals,
+ *    used exactly as in the monolith — not destructured from ctx.)
+ * Registers onto ctx:
+ *   composeAdapter = { templatesDir, readTextFile, loadTemplate,
+ *     listTemplateFiles, findIdentityIn, findIdentity, createLocalFile,
+ *     filePathsToAttachDescs, descsToMsgAttachments, addAttachmentsToComposeWindow,
+ *     injectAttachmentsAsync, getReplyAllCcRecipients,
+ *     applyComposeRecipientOverrides, formatBodyFragmentHtml,
+ *     moveComposeSelectionToBodyStartIfRange, insertReplyBodyIntoComposeWindow,
+ *     openComposeWindowWithCustomizations, markMessageDispositionState,
+ *     sendMessageDirectly, resolveComposeFormat, setComposeIdentity,
+ *     MAX_BASE64_SIZE, MAX_FILE_PATH_ATTACHMENT_BYTES }
+ */
 module.exports = function register(ctx) {
   const {
-    Cc,
-    Ci,
-    Services,
-    MailServices,
-    AUDIT_LOG_SUBDIR,
-    appendComposeAudit,
-    findIdempotentEntry,
-    isAccountAllowed,
-    isSkipReviewBlocked,
-    getAccessibleAccounts,
-    extractPlainTextBody,
-    findMessage,
-    isSensitiveFilePath,
-    sanitizeHeaderLine,
-    countRecipients,
-    _attachTimers,
-    _tempAttachFiles,
-    _claimedComposeWindows,
+    Cc, Ci, Services, MailServices, AUDIT_LOG_SUBDIR,
+    isAccountAllowed, getAccessibleAccounts,
+    isSensitiveFilePath, composeEntity,
+    _attachTimers, _tempAttachFiles, _claimedComposeWindows,
   } = ctx;
+
+  // Pure helpers shaped in the entity layer; pulled into bare names so the
+  // copied-verbatim bodies below keep calling them exactly as in the monolith.
+  const {
+    escapeHtml, formatBodyHtml, splitAddressHeader, extractAddressEmail,
+    mergeAddressHeaders, getIdentityAutoRecipientHeader,
+  } = composeEntity;
 
   // ── Compose-related constants (used only by the compose/template tools). ──
   const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
@@ -77,44 +88,6 @@ module.exports = function register(ctx) {
               return text;
             }
 
-            /**
-             * Parse Jekyll-style frontmatter. Accepts a minimal YAML subset:
-             * `key: value` per line for strings / numbers / booleans, and
-             * `key: [a, b]` for one-line arrays. Anything more elaborate
-             * (multi-line arrays, nested mappings) is intentionally not
-             * supported -- the format stays predictable for the LLM.
-             */
-            function parseFrontmatter(raw) {
-              if (!raw.startsWith("---")) return { meta: {}, body: raw };
-              const end = raw.indexOf("\n---", 3);
-              if (end < 0) return { meta: {}, body: raw };
-              const yamlBlock = raw.slice(3, end).trim();
-              let body = raw.slice(end + 4);
-              if (body.startsWith("\n")) body = body.slice(1);
-              const meta = Object.create(null);
-              for (const line of yamlBlock.split(/\r?\n/)) {
-                const stripped = line.trim();
-                if (!stripped || stripped.startsWith("#")) continue;
-                const m = stripped.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
-                if (!m) continue;
-                const key = m[1];
-                let val = m[2].trim();
-                if (val === "true") meta[key] = true;
-                else if (val === "false") meta[key] = false;
-                else if (/^-?\d+(\.\d+)?$/.test(val)) meta[key] = Number(val);
-                else if (val.startsWith("[") && val.endsWith("]")) {
-                  meta[key] = val.slice(1, -1).split(",").map(s => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
-                } else {
-                  // Strip surrounding quotes if present
-                  if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-                    val = val.slice(1, -1);
-                  }
-                  meta[key] = val;
-                }
-              }
-              return { meta, body };
-            }
-
             function loadTemplate(name) {
               if (typeof name !== "string" || !name) return { error: "name must be a non-empty string" };
               if (!/^[A-Za-z0-9._-]+$/.test(name)) {
@@ -131,7 +104,7 @@ module.exports = function register(ctx) {
                 if (f.exists() && f.isFile()) {
                   try {
                     const raw = readTextFile(f);
-                    const parsed = parseFrontmatter(raw);
+                    const parsed = composeEntity.parseFrontmatter(raw);
                     parsed.file = f.path;
                     return parsed;
                   } catch (e) {
@@ -142,7 +115,15 @@ module.exports = function register(ctx) {
               return { error: `Template not found: ${name}` };
             }
 
-            function listTemplates() {
+            /**
+             * Enumerate the templates directory and parse each *.md file's
+             * frontmatter into a listing record. Returns the same envelope the
+             * original listTemplates tool returned: { templates } on success,
+             * { templates, note } when the directory is missing, or { error }
+             * when enumeration fails. Behavior is byte-for-byte identical to the
+             * monolith's listTemplates -- the service just forwards it.
+             */
+            function listTemplateFiles() {
               const dir = templatesDir();
               if (!dir.exists()) {
                 return { templates: [], note: `Templates directory does not exist yet. Create ${dir.path} and drop *.md files inside.` };
@@ -160,7 +141,7 @@ module.exports = function register(ctx) {
                 if (!/\.md$/i.test(f.leafName)) continue;
                 try {
                   const raw = readTextFile(f);
-                  const { meta } = parseFrontmatter(raw);
+                  const { meta } = composeEntity.parseFrontmatter(raw);
                   out.push({
                     name: typeof meta.name === "string" && meta.name ? meta.name : f.leafName.replace(/\.md$/i, ""),
                     description: typeof meta.description === "string" ? meta.description : "",
@@ -172,33 +153,6 @@ module.exports = function register(ctx) {
                 } catch { /* skip unreadable templates */ }
               }
               return { templates: out };
-            }
-
-            function renderTemplate(name, vars) {
-              const tpl = loadTemplate(name);
-              if (tpl.error) return tpl;
-              const declaredVars = Array.isArray(tpl.meta.vars) ? tpl.meta.vars : [];
-              const bindings = (vars && typeof vars === "object" && !Array.isArray(vars)) ? vars : {};
-              // Required-var enforcement: every declared var must be supplied.
-              const missing = declaredVars.filter(v => !(v in bindings));
-              if (missing.length > 0) {
-                return { error: `Missing required variables: ${missing.join(", ")}` };
-              }
-              function substitute(text) {
-                return String(text).replace(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g, (_, key) => {
-                  if (key in bindings) return String(bindings[key]);
-                  // Unknown placeholder -> leave as literal so the caller
-                  // notices instead of silently producing an empty value.
-                  return `{{${key}}}`;
-                });
-              }
-              return {
-                name: tpl.meta.name || name,
-                subject: substitute(tpl.meta.subject || ""),
-                body: substitute(tpl.body),
-                isHtml: !!tpl.meta.isHtml,
-                file: tpl.file,
-              };
             }
 
             /**
@@ -421,30 +375,6 @@ module.exports = function register(ctx) {
               }, COMPOSE_WINDOW_LOAD_DELAY_MS, Ci.nsITimer.TYPE_ONE_SHOT);
             }
 
-            function splitAddressHeader(header) {
-              return (header || "").match(/(?:[^,"]|"[^"]*")+/g) || [];
-            }
-
-            function extractAddressEmail(address) {
-              return (address.match(/<([^>]+)>/)?.[1] || address.trim()).toLowerCase();
-            }
-
-            function mergeAddressHeaders(...headers) {
-              const seen = new Set();
-              const merged = [];
-              for (const header of headers) {
-                for (const raw of splitAddressHeader(header)) {
-                  const address = raw.trim();
-                  if (!address) continue;
-                  const email = extractAddressEmail(address);
-                  if (seen.has(email)) continue;
-                  seen.add(email);
-                  merged.push(address);
-                }
-              }
-              return merged.join(", ");
-            }
-
             function getReplyAllCcRecipients(msgHdr, folder) {
               const ownAccount = MailServices.accounts.findAccountForServer(folder.server);
               const ownEmails = new Set();
@@ -470,19 +400,6 @@ module.exports = function register(ctx) {
               });
 
               return uniqueRecipients.join(", ");
-            }
-
-            function getIdentityAutoRecipientHeader(identity, kind) {
-              if (!identity) return "";
-              try {
-                if (kind === "cc") {
-                  return identity.doCc ? (identity.doCcList || "") : "";
-                }
-                if (kind === "bcc") {
-                  return identity.doBcc ? (identity.doBccList || "") : "";
-                }
-              } catch {}
-              return "";
             }
 
             function applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc) {
@@ -938,23 +855,6 @@ module.exports = function register(ctx) {
               });
             }
 
-            function escapeHtml(s) {
-              return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-            }
-
-            /**
-             * Converts body text to HTML for compose fields.
-             * Handles both HTML input (entity-encodes non-ASCII) and plain text.
-             */
-            function formatBodyHtml(body, isHtml) {
-              if (isHtml) {
-                let text = (body || "").replace(/\n/g, '');
-                text = [...text].map(c => c.codePointAt(0) > 127 ? `&#${c.codePointAt(0)};` : c).join('');
-                return text;
-              }
-              return escapeHtml(body || "").replace(/\n/g, '<br>');
-            }
-
             /**
              * Decides whether a compose operation will (or should) run in HTML
              * mode, and returns the matching msgComposeParams.format value.
@@ -1042,712 +942,31 @@ module.exports = function register(ctx) {
               return "";
             }
 
-            function dryRunCompose(to, subject, body, cc, bcc, isHtml, from, attachments) {
-              const result = {
-                wouldSucceed: true,
-                blockers: [],
-                resolvedIdentity: null,
-                isHtml: !!isHtml,
-                subjectAfterSanitization: sanitizeHeaderLine(subject || ""),
-                bodyLength: typeof body === "string" ? body.length : 0,
-                recipients: {
-                  to: countRecipients(to),
-                  cc: countRecipients(cc),
-                  bcc: countRecipients(bcc),
-                },
-                attachments: [],
-                skipReviewBlocked: isSkipReviewBlocked(),
-              };
-
-              // Resolve identity through the same accessible-account path used
-              // by composeMail, but never fall back silently to the default --
-              // if `from` is set and doesn't match, surface the same error
-              // sendMail would return.
-              try {
-                if (from) {
-                  const identity = findIdentity(from);
-                  if (!identity) {
-                    result.blockers.push(`from identity not found or not accessible: ${from}`);
-                    result.wouldSucceed = false;
-                  } else {
-                    result.resolvedIdentity = {
-                      key: identity.key,
-                      email: identity.email,
-                      fullName: identity.fullName || null,
-                    };
-                  }
-                } else {
-                  // Default identity preview: first accessible identity.
-                  const accounts = getAccessibleAccounts();
-                  const firstIdentity = accounts[0] && accounts[0].defaultIdentity;
-                  if (firstIdentity) {
-                    result.resolvedIdentity = {
-                      key: firstIdentity.key,
-                      email: firstIdentity.email,
-                      fullName: firstIdentity.fullName || null,
-                      isDefault: true,
-                    };
-                  }
-                }
-              } catch (e) {
-                result.blockers.push(`identity resolution failed: ${e.message || e}`);
-                result.wouldSucceed = false;
-              }
-
-              // Per-attachment evaluation. Mirrors filePathsToAttachDescs but
-              // never copies / decodes / writes anything; only reports verdict.
-              if (Array.isArray(attachments)) {
-                for (const entry of attachments) {
-                  const att = { kind: null, name: null, status: "ok", reason: null, size: null };
-                  if (typeof entry === "string") {
-                    att.kind = "path";
-                    att.name = entry;
-                    if (isSensitiveFilePath(entry)) {
-                      att.status = "blocked";
-                      att.reason = "sensitive path";
-                    } else {
-                      try {
-                        const file = createLocalFile(entry);
-                        if (!file.exists()) {
-                          att.status = "missing";
-                          att.reason = "file does not exist";
-                        } else {
-                          try { att.size = file.fileSize; } catch { att.size = null; }
-                          if (att.size !== null && att.size > MAX_FILE_PATH_ATTACHMENT_BYTES) {
-                            att.status = "blocked";
-                            att.reason = `exceeds ${MAX_FILE_PATH_ATTACHMENT_BYTES / 1024 / 1024}MB cap`;
-                          }
-                        }
-                      } catch (e) {
-                        att.status = "error";
-                        att.reason = e.message || String(e);
-                      }
-                    }
-                  } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
-                    att.kind = "inline";
-                    att.name = entry.name;
-                    const b64 = entry.base64 || entry.content;
-                    att.size = typeof b64 === "string" ? Math.floor((b64.length * 3) / 4) : null;
-                    if (typeof b64 === "string" && b64.length > MAX_BASE64_SIZE) {
-                      att.status = "blocked";
-                      att.reason = `inline base64 exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB`;
-                    }
-                  } else {
-                    att.kind = "invalid";
-                    att.name = typeof entry === "object" ? JSON.stringify(entry).slice(0, 80) : String(entry);
-                    att.status = "blocked";
-                    att.reason = "neither a file path nor an inline {name, base64} object";
-                  }
-                  if (att.status !== "ok") {
-                    result.wouldSucceed = false;
-                  }
-                  result.attachments.push(att);
-                }
-              }
-
-              return result;
-            }
-
-            /**
-             * Composes a new email. Opens a compose window for review, or sends
-             * directly when skipReview is true.
-             *
-             * HTML body handling quirks:
-             * 1. Strip newlines from HTML - Thunderbird adds <br> for each \n
-             * 2. Encode non-ASCII as HTML entities - compose window has charset issues
-             *    with emojis/unicode even with <meta charset="UTF-8">
-             */
-            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview, idempotencyKey) {
-              try {
-                if (skipReview && isSkipReviewBlocked()) {
-                  return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
-                }
-                // Idempotency: if a prior successful sendMail with this key
-                // ran in the last 24h, return its result instead of sending
-                // again. The audit-log entry is the source of truth.
-                if (typeof idempotencyKey === "string" && idempotencyKey) {
-                  const prior = findIdempotentEntry("sendMail", idempotencyKey);
-                  if (prior) {
-                    return { ...prior, idempotent: true, idempotencyKey };
-                  }
-                }
-                appendComposeAudit({
-                  tool: "sendMail",
-                  skipReview: !!skipReview,
-                  isHtml: !!isHtml,
-                  from: typeof from === "string" ? from : null,
-                  to: countRecipients(to),
-                  cc: countRecipients(cc),
-                  bcc: countRecipients(bcc),
-                  subject: typeof subject === "string" ? subject.slice(0, 200) : null,
-                  attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
-                  idempotencyKey: typeof idempotencyKey === "string" ? idempotencyKey.slice(0, 256) : null,
-                });
-                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
-                  .createInstance(Ci.nsIMsgComposeParams);
-
-                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
-                  .createInstance(Ci.nsIMsgCompFields);
-
-                composeFields.to = to || "";
-                composeFields.cc = cc || "";
-                composeFields.bcc = bcc || "";
-                composeFields.subject = sanitizeHeaderLine(subject || "");
-
-                msgComposeParams.type = Ci.nsIMsgCompType.New;
-                msgComposeParams.composeFields = composeFields;
-
-                const identityResult = setComposeIdentity(msgComposeParams, from, null);
-                if (identityResult && identityResult.error) return identityResult;
-
-                // Match body shape and format to caller intent / identity pref.
-                // When the resolved mode is plain, ship a plain body -- the HTML
-                // envelope would otherwise render as literal text in plain-mode
-                // editors and recipients.
-                const { useHtml, format } = resolveComposeFormat(msgComposeParams.identity, isHtml, Ci.nsIMsgCompType.New);
-                msgComposeParams.format = format;
-                if (useHtml) {
-                  const formatted = formatBodyHtml(body, isHtml);
-                  composeFields.body = isHtml && formatted.includes('<html')
-                    ? formatted
-                    : `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
-                } else {
-                  composeFields.body = body || "";
-                }
-
-                const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
-
-                if (skipReview) {
-                  return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New, Ci.nsIMsgCompDeliverMode.Now, useHtml ? "text/html" : "text/plain").then(result => {
-                    if (result.success) {
-                      let msg = "Message sent";
-                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-                      result.message = msg;
-                      // Idempotency: record the successful outcome so a retry
-                      // with the same key returns this result instead of
-                      // sending again. The pre-send audit entry only records
-                      // intent; findIdempotentEntry filters to success:true.
-                      if (typeof idempotencyKey === "string" && idempotencyKey) {
-                        appendComposeAudit({
-                          tool: "sendMail",
-                          success: true,
-                          idempotencyKey: idempotencyKey.slice(0, 256),
-                          result,
-                        });
-                      }
-                    }
-                    return result;
-                  });
-                }
-
-                const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                  .getService(Ci.nsIMsgComposeService);
-                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-
-                injectAttachmentsAsync(fileDescs);
-
-                let msg = "Compose window opened";
-                if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-                return { success: true, message: msg };
-              } catch (e) {
-                return { error: e.toString() };
-              }
-            }
-
-            /**
-             * Saves a composed message to the identity's Drafts folder without
-             * sending or opening a compose window. The destination folder is
-             * resolved by Thunderbird from the identity's draft-folder pref.
-             */
-            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments) {
-              try {
-                appendComposeAudit({
-                  tool: "saveDraft",
-                  isHtml: !!isHtml,
-                  from: typeof from === "string" ? from : null,
-                  to: countRecipients(to),
-                  cc: countRecipients(cc),
-                  bcc: countRecipients(bcc),
-                  subject: typeof subject === "string" ? subject.slice(0, 200) : null,
-                  attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
-                });
-                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
-                  .createInstance(Ci.nsIMsgComposeParams);
-
-                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
-                  .createInstance(Ci.nsIMsgCompFields);
-
-                composeFields.to = to || "";
-                composeFields.cc = cc || "";
-                composeFields.bcc = bcc || "";
-                composeFields.subject = sanitizeHeaderLine(subject || "");
-
-                msgComposeParams.type = Ci.nsIMsgCompType.New;
-                msgComposeParams.composeFields = composeFields;
-
-                const identityResult = setComposeIdentity(msgComposeParams, from, null);
-                if (identityResult && identityResult.error) return identityResult;
-
-                const { useHtml, format } = resolveComposeFormat(msgComposeParams.identity, isHtml, Ci.nsIMsgCompType.New);
-                msgComposeParams.format = format;
-                if (useHtml) {
-                  const formatted = formatBodyHtml(body, isHtml);
-                  composeFields.body = isHtml && formatted.includes('<html')
-                    ? formatted
-                    : `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
-                } else {
-                  composeFields.body = body || "";
-                }
-
-                const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
-
-                return sendMessageDirectly(
-                  composeFields,
-                  msgComposeParams.identity,
-                  fileDescs,
-                  null,
-                  Ci.nsIMsgCompType.New,
-                  Ci.nsIMsgCompDeliverMode.SaveAsDraft,
-                  useHtml ? "text/html" : "text/plain"
-                ).then(result => {
-                  if (result.success) {
-                    let msg = "Draft saved";
-                    if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-                    result.message = msg;
-                  }
-                  return result;
-                });
-              } catch (e) {
-                return { error: e.toString() };
-              }
-            }
-
-            /**
-             * Replies to a message with quoted original. Opens a compose window
-             * for review, or sends directly when skipReview is true.
-             *
-             * Review path uses Thunderbird's native reply compose flow so it can
-             * build the quoted original, place the identity signature according
-             * to user preferences, and set threading headers/disposition flags.
-             * skipReview still uses direct send, so it keeps a manual quoted body
-             * and manually marks the original as replied after a successful send.
-             */
-	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview, idempotencyKey) {
-	              return new Promise((resolve) => {
-	                try {
-	                  if (skipReview && isSkipReviewBlocked()) {
-	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
-	                    return;
-	                  }
-	                  if (typeof idempotencyKey === "string" && idempotencyKey) {
-	                    const prior = findIdempotentEntry("replyToMessage", idempotencyKey);
-	                    if (prior) {
-	                      resolve({ ...prior, idempotent: true, idempotencyKey });
-	                      return;
-	                    }
-	                  }
-	                  appendComposeAudit({
-	                    tool: "replyToMessage",
-	                    skipReview: !!skipReview,
-	                    replyAll: !!replyAll,
-	                    isHtml: !!isHtml,
-	                    from: typeof from === "string" ? from : null,
-	                    originalMessageId: typeof messageId === "string" ? messageId.slice(0, 256) : null,
-	                    to: countRecipients(to),
-	                    cc: countRecipients(cc),
-	                    bcc: countRecipients(bcc),
-	                    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
-	                    idempotencyKey: typeof idempotencyKey === "string" ? idempotencyKey.slice(0, 256) : null,
-	                  });
-	                  const found = findMessage(messageId, folderPath);
-	                  if (found.error) {
-	                    resolve({ error: found.error });
-	                    return;
-	                  }
-	                  const { msgHdr, folder } = found;
-	                  const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
-	                  const msgURI = folder.getUriForMsg(msgHdr);
-	                  const compType = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
-
-	                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
-	                    .createInstance(Ci.nsIMsgComposeParams);
-
-	                  const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
-	                    .createInstance(Ci.nsIMsgCompFields);
-
-	                  msgComposeParams.type = compType;
-	                  msgComposeParams.originalMsgURI = msgURI;
-	                  msgComposeParams.composeFields = composeFields;
-
-	                  try {
-	                    msgComposeParams.origMsgHdr = msgHdr;
-	                  } catch {}
-
-	                  const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
-	                  if (identityResult && identityResult.error) {
-	                    resolve(identityResult);
-	                    return;
-	                  }
-
-	                  // Resolve compose mode against caller intent + identity pref.
-	                  // The skipReview branch reads useHtml below to shape the body.
-	                  const { useHtml: replyUseHtml, format: replyFormat } =
-	                    resolveComposeFormat(msgComposeParams.identity, isHtml, compType);
-	                  msgComposeParams.format = replyFormat;
-
-	                  // Pass through only the fields the caller explicitly provided.
-	                  // Any field left undefined is filled in by Thunderbird's native
-	                  // reply/reply-all machinery (including proper Reply-To,
-	                  // Mail-Followup-To, mailing-list handling, and self-filtering
-	                  // against the selected identity). Our old custom
-	                  // getReplyAllCcRecipients path bypassed all of that.
-	                  const reviewTo = to;
-	                  const reviewCc = cc;
-
-	                  if (skipReview) {
-	                    const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-	                      "resource:///modules/gloda/MimeMessage.sys.mjs"
-                      );
-
-	                    MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
-	                      try {
-	                        const originalBody = extractPlainTextBody(aMimeMsg);
-
-	                        if (replyAll) {
-	                          composeFields.to = to || msgHdr.author;
-	                          if (cc) {
-	                            composeFields.cc = cc;
-	                          } else {
-	                            const replyAllCc = getReplyAllCcRecipients(msgHdr, folder);
-	                            if (replyAllCc) composeFields.cc = replyAllCc;
-	                          }
-	                        } else {
-	                          composeFields.to = to || msgHdr.author;
-	                          if (cc) composeFields.cc = cc;
-	                        }
-
-	                        composeFields.bcc = bcc || "";
-
-	                        const origSubject = sanitizeHeaderLine(msgHdr.mime2DecodedSubject || msgHdr.subject || "");
-	                        composeFields.subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`;
-	                        composeFields.references = `<${messageId}>`;
-	                        composeFields.setHeader("In-Reply-To", `<${messageId}>`);
-
-	                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
-	                        const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-
-	                        // Direct send goes through nsIMsgSend, not nsIMsgCompose, so
-	                        // it still uses a hand-built quoted body and cannot place the
-	                        // identity signature according to reply preferences. The shape
-	                        // matches the resolved compose mode -- shipping an HTML envelope
-	                        // for a plain-format send would otherwise render as literal
-	                        // markup in the recipient's mail client.
-	                        if (replyUseHtml) {
-	                          const quotedLines = originalBody.split('\n').map(line =>
-	                            `&gt; ${escapeHtml(line)}`
-	                          ).join('<br>');
-	                          const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
-	                          const quoteBlock = isHtml
-	                            ? `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<blockquote type="cite">${quotedHtml}</blockquote>`
-	                            : `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<br>${quotedLines}`;
-	                          composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
-	                        } else {
-	                          const quotedLines = originalBody.split('\n').map(line => `> ${line}`).join('\n');
-	                          composeFields.body = `${body || ""}\n\nOn ${dateStr}, ${author} wrote:\n${quotedLines}`;
-	                        }
-
-	                        sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType, Ci.nsIMsgCompDeliverMode.Now, replyUseHtml ? "text/html" : "text/plain").then(result => {
-	                          if (result.success) {
-	                            let repliedDisposition = null;
-	                            try {
-	                              repliedDisposition = Ci.nsIMsgFolder.nsMsgDispositionState_Replied;
-	                            } catch {}
-	                            markMessageDispositionState(msgHdr, repliedDisposition);
-
-	                            let msg = "Reply sent";
-	                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-	                            result.message = msg;
-	                            if (typeof idempotencyKey === "string" && idempotencyKey) {
-	                              appendComposeAudit({
-	                                tool: "replyToMessage",
-	                                success: true,
-	                                idempotencyKey: idempotencyKey.slice(0, 256),
-	                                result,
-	                              });
-	                            }
-	                          }
-	                          resolve(result);
-	                        });
-	                      } catch (e) {
-	                        resolve({ error: e.toString() });
-	                      }
-	                    }, true, { examineEncryptedParts: true });
-	                    return;
-	                  }
-
-	                  openComposeWindowWithCustomizations(
-	                    msgComposeParams,
-	                    msgURI,
-	                    compType,
-	                    msgComposeParams.identity,
-	                    body,
-	                    isHtml,
-	                    reviewTo,
-	                    reviewCc,
-	                    bcc,
-	                    fileDescs
-	                  ).then(result => {
-	                    if (result.success) {
-	                      let msg = "Reply window opened";
-	                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-	                      result.message = msg;
-	                    }
-	                    resolve(result);
-	                  });
-
-	                } catch (e) {
-	                  resolve({ error: e.toString() });
-	                }
-	              });
-            }
-
-            /**
-             * Forwards a message with original content and attachments.
-             *
-             * Review path uses Thunderbird's native ForwardInline compose flow so
-             * TB builds the forward body with a proper <blockquote type="cite">
-             * quote, auto-attaches the original message's attachments, places the
-             * identity signature per user preferences, and sets the $Forwarded
-             * disposition on the original after a successful send. The caller's
-             * intro body is injected via NotifyComposeBodyReady, mirroring how
-             * replyToMessage handles intro injection.
-             *
-             * skipReview still uses direct send, so it keeps a manual forward
-             * block + auto-attaches originals from MsgHdrToMimeMessage + manually
-             * marks the original as forwarded after a successful send.
-             */
-            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview, idempotencyKey) {
-              return new Promise((resolve) => {
-                try {
-                  if (skipReview && isSkipReviewBlocked()) {
-                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
-                    return;
-                  }
-                  if (typeof idempotencyKey === "string" && idempotencyKey) {
-                    const prior = findIdempotentEntry("forwardMessage", idempotencyKey);
-                    if (prior) {
-                      resolve({ ...prior, idempotent: true, idempotencyKey });
-                      return;
-                    }
-                  }
-                  appendComposeAudit({
-                    tool: "forwardMessage",
-                    skipReview: !!skipReview,
-                    isHtml: !!isHtml,
-                    from: typeof from === "string" ? from : null,
-                    originalMessageId: typeof messageId === "string" ? messageId.slice(0, 256) : null,
-                    to: countRecipients(to),
-                    cc: countRecipients(cc),
-                    bcc: countRecipients(bcc),
-                    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
-                    idempotencyKey: typeof idempotencyKey === "string" ? idempotencyKey.slice(0, 256) : null,
-                  });
-                  const found = findMessage(messageId, folderPath);
-                  if (found.error) {
-                    resolve({ error: found.error });
-                    return;
-                  }
-                  const { msgHdr, folder } = found;
-                  const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
-                  const msgURI = folder.getUriForMsg(msgHdr);
-                  const compType = Ci.nsIMsgCompType.ForwardInline;
-
-                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
-                    .createInstance(Ci.nsIMsgComposeParams);
-
-                  const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
-                    .createInstance(Ci.nsIMsgCompFields);
-
-                  msgComposeParams.type = compType;
-                  msgComposeParams.originalMsgURI = msgURI;
-                  msgComposeParams.composeFields = composeFields;
-
-                  try {
-                    msgComposeParams.origMsgHdr = msgHdr;
-                  } catch {}
-
-                  const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
-                  if (identityResult && identityResult.error) {
-                    resolve(identityResult);
-                    return;
-                  }
-
-                  // ForwardInline only passes the format flag through when it is
-                  // Default or OppositeOfDefault -- HTML/PlainText are ignored and
-                  // the identity's compose pref always wins. resolveComposeFormat
-                  // returns OppositeOfDefault when the caller's explicit isHtml
-                  // conflicts with the identity pref so we can still force the
-                  // intended editor mode.
-                  const { useHtml: fwdUseHtml, format: fwdFormat } =
-                    resolveComposeFormat(msgComposeParams.identity, isHtml, compType);
-                  msgComposeParams.format = fwdFormat;
-
-                  if (skipReview) {
-                    const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-                      "resource:///modules/gloda/MimeMessage.sys.mjs"
-                    );
-
-                    MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
-                      try {
-                        const originalBody = extractPlainTextBody(aMimeMsg);
-
-                        composeFields.to = to;
-                        composeFields.cc = cc || "";
-                        composeFields.bcc = bcc || "";
-
-                        const origSubject = sanitizeHeaderLine(msgHdr.mime2DecodedSubject || msgHdr.subject || "");
-                        composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
-
-                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
-                        const fwdAuthor = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-                        const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
-
-                        // Direct send goes through nsIMsgSend, not nsIMsgCompose,
-                        // so we hand-build the forward block. The shape matches the
-                        // resolved compose mode -- shipping an HTML envelope for a
-                        // plain-format send would render as literal markup in the
-                        // recipient's mail client.
-                        if (fwdUseHtml) {
-                          const fwdHeaderHtml =
-                            `-------- Forwarded Message --------<br>` +
-                            `Subject: ${escapeHtml(origSubject)}<br>` +
-                            `Date: ${dateStr}<br>` +
-                            `From: ${escapeHtml(fwdAuthor)}<br>` +
-                            `To: ${escapeHtml(fwdRecipients)}<br><br>`;
-                          const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
-                          const quotedLinesHtml = originalBody.split('\n').map(line =>
-                            `&gt; ${escapeHtml(line)}`
-                          ).join('<br>');
-                          const forwardBlock = isHtml
-                            ? `<blockquote type="cite">${fwdHeaderHtml}${quotedHtml}</blockquote>`
-                            : `${fwdHeaderHtml}${quotedLinesHtml}`;
-                          const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
-                          composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
-                        } else {
-                          const fwdHeader =
-                            `-------- Forwarded Message --------\n` +
-                            `Subject: ${origSubject}\n` +
-                            `Date: ${dateStr}\n` +
-                            `From: ${fwdAuthor}\n` +
-                            `To: ${fwdRecipients}\n\n`;
-                          composeFields.body = `${body ? body + '\n\n' : ''}${fwdHeader}${originalBody}`;
-                        }
-
-                        const origDescs = [];
-                        if (aMimeMsg && aMimeMsg.allUserAttachments) {
-                          for (const att of aMimeMsg.allUserAttachments) {
-                            try {
-                              origDescs.push({ url: att.url, name: att.name, contentType: att.contentType });
-                            } catch {
-                              // Skip unreadable original attachments
-                            }
-                          }
-                        }
-                        const allDescs = [...origDescs, ...fileDescs];
-
-                        sendMessageDirectly(composeFields, msgComposeParams.identity, allDescs, msgURI, compType, Ci.nsIMsgCompDeliverMode.Now, fwdUseHtml ? "text/html" : "text/plain").then(result => {
-                          if (result.success) {
-                            let forwardedDisposition = null;
-                            try {
-                              forwardedDisposition = Ci.nsIMsgFolder.nsMsgDispositionState_Forwarded;
-                            } catch {}
-                            markMessageDispositionState(msgHdr, forwardedDisposition);
-
-                            let msg = `Forward sent with ${allDescs.length} attachment(s)`;
-                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-                            result.message = msg;
-                            if (typeof idempotencyKey === "string" && idempotencyKey) {
-                              appendComposeAudit({
-                                tool: "forwardMessage",
-                                success: true,
-                                idempotencyKey: idempotencyKey.slice(0, 256),
-                                result,
-                              });
-                            }
-                          }
-                          resolve(result);
-                        });
-                      } catch (e) {
-                        resolve({ error: e.toString() });
-                      }
-                    }, true, { examineEncryptedParts: true });
-                    return;
-                  }
-
-                  // Review path: TB builds the forward body and auto-attaches the
-                  // original's attachments via ForwardInline. The intro body and
-                  // user-specified extra attachments are injected once the compose
-                  // window's editor signals NotifyComposeBodyReady. Subject is set
-                  // by TB from origMsgHdr.
-                  openComposeWindowWithCustomizations(
-                    msgComposeParams,
-                    msgURI,
-                    compType,
-                    msgComposeParams.identity,
-                    body,
-                    isHtml,
-                    to,
-                    cc,
-                    bcc,
-                    fileDescs
-                  ).then(result => {
-                    if (result.success) {
-                      let msg = "Forward window opened";
-                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-                      result.message = msg;
-                    }
-                    resolve(result);
-                  });
-                } catch (e) {
-                  resolve({ error: e.toString() });
-                }
-              });
-            }
-
   Object.assign(ctx, {
-    templatesDir,
-    readTextFile,
-    parseFrontmatter,
-    loadTemplate,
-    listTemplates,
-    renderTemplate,
-    findIdentityIn,
-    findIdentity,
-    createLocalFile,
-    filePathsToAttachDescs,
-    descsToMsgAttachments,
-    addAttachmentsToComposeWindow,
-    injectAttachmentsAsync,
-    splitAddressHeader,
-    extractAddressEmail,
-    mergeAddressHeaders,
-    getReplyAllCcRecipients,
-    getIdentityAutoRecipientHeader,
-    applyComposeRecipientOverrides,
-    formatBodyFragmentHtml,
-    moveComposeSelectionToBodyStartIfRange,
-    insertReplyBodyIntoComposeWindow,
-    openComposeWindowWithCustomizations,
-    markMessageDispositionState,
-    sendMessageDirectly,
-    escapeHtml,
-    formatBodyHtml,
-    resolveComposeFormat,
-    setComposeIdentity,
-    dryRunCompose,
-    composeMail,
-    saveDraft,
-    replyToMessage,
-    forwardMessage,
+    composeAdapter: {
+      templatesDir,
+      readTextFile,
+      loadTemplate,
+      listTemplateFiles,
+      findIdentityIn,
+      findIdentity,
+      createLocalFile,
+      filePathsToAttachDescs,
+      descsToMsgAttachments,
+      addAttachmentsToComposeWindow,
+      injectAttachmentsAsync,
+      getReplyAllCcRecipients,
+      applyComposeRecipientOverrides,
+      formatBodyFragmentHtml,
+      moveComposeSelectionToBodyStartIfRange,
+      insertReplyBodyIntoComposeWindow,
+      openComposeWindowWithCustomizations,
+      markMessageDispositionState,
+      sendMessageDirectly,
+      resolveComposeFormat,
+      setComposeIdentity,
+      MAX_BASE64_SIZE,
+      MAX_FILE_PATH_ATTACHMENT_BYTES,
+    },
   });
 };

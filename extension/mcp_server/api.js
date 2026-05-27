@@ -153,10 +153,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       inspectRateLimits,
     } = __helperScope.module.exports;
 
-    // One rate-limiter state per server instance. Resets on extension reload
-    // -- intentional: that's typically a developer action and we don't want a
-    // restart to feel "stuck" for the windowMs duration.
-    const __rateLimiterState = createRateLimiterState();
+    // The rate-limiter STATE is now created and owned by
+    // infrastructure/audit.js (registered as ctx.rateLimiterState, consumed via
+    // ctx.consumeRateLimitFor / ctx.inspectRateLimitsState). The algorithm
+    // (createRateLimiterState/consumeRateLimit/inspectRateLimits) still lives in
+    // security_helpers.js and is passed down through ctx.
 
     const tools = [
       {
@@ -1169,837 +1170,92 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               try { globalThis.__tbMcpServer.stop(() => {}); } catch { /* ignore */ }
               globalThis.__tbMcpServer = null;
             }
-            const { HttpServer } = ChromeUtils.importESModule(
-              "resource://thunderbird-mcp/httpd.sys.mjs?" + Date.now()
-            );
-            const { NetUtil } = ChromeUtils.importESModule(
-              "resource://gre/modules/NetUtil.sys.mjs"
-            );
-            const { MailServices } = ChromeUtils.importESModule(
-              "resource:///modules/MailServices.sys.mjs"
-            );
+            // ── DDD layer wiring: build the shared ctx (the "DI container") ──
+            //
+            // A WebExtension Experiment API loads ONE parent script (this file)
+            // and supports neither a multi-script manifest nor ES `import`. The
+            // only mechanism is Services.scriptloader.loadSubScript + a single
+            // shared object. So `ctx` IS the dependency-injection container and
+            // a deterministic load order IS the wiring graph.
+            //
+            // Load order (dependency order):
+            //   infrastructure: services → connection → auth → audit → access → dispatch
+            //   domain entities: domain/entities/* (pure; loaded by the layer that needs them)
+            //   contacts (reference domain): entity → adapter → service → tools
+            //   legacy domains (not yet migrated): mail, compose, calendar, filters
+            //
+            // Each module exports register(ctx): it destructures what it needs
+            // from ctx and Object.assign()s its exports back. After loading we
+            // pull the registered functions into local const bindings so the
+            // request handler / dispatch below can keep calling them by their
+            // original bare names.
+            const ctx = {
+              // XPCOM globals (file-scope globals, shared down to every layer)
+              Cc, Ci, Services, ChromeUtils,
+              // File-scope constants the layers consume
+              MAX_SEARCH_RESULTS_CAP, DEFAULT_MAX_RESULTS,
+              PREF_ALLOWED_ACCOUNTS, PREF_DISABLED_TOOLS, PREF_BLOCK_SKIPREVIEW,
+              PREF_BLOCK_FILTER_FORWARD_REPLY, PREF_BLOCK_CONTACT_WRITES,
+              PREF_BLOCK_MAILBOX_EXPORT, UNDISABLEABLE_TOOLS, INTERNAL_KEYWORDS,
+              // Pure helpers from security_helpers.js (already in scope)
+              isSensitiveFilePath, sanitizeHeaderLine, UNTRUSTED_CLOSE,
+              wrapUntrustedBody, wrapUntrustedPreview, countRecipients,
+              summarizeAttachmentsForAudit, isSafeMarkdownHref, isSafeImageSrc,
+              escapeMarkdownLinkText, renderMarkdownLink, isSystemPrincipalFetchAllowed,
+              validateAgainstSchema, createRateLimiterState, consumeRateLimit,
+              inspectRateLimits,
+              // The tool METADATA registry (single source of truth; a structural
+              // test parses this file for it, so it stays defined here).
+              tools,
+              // Auth-token generators stay in the OUTER getAPI scope (settings
+              // API methods call them outside start()); pass them down so
+              // infrastructure/auth.js can resolve the active token.
+              getStableAuthTokenPref, generateAuthToken,
+              // Shared mutable state that the shutdown path (outside start) and
+              // the compose/mail domains both touch.
+              _attachTimers, _tempAttachFiles, _claimedComposeWindows,
+            };
 
-            let cal = null;
-            let CalEvent = null;
-            let CalTodo = null;
-            try {
-              const calModule = ChromeUtils.importESModule(
-                "resource:///modules/calendar/calUtils.sys.mjs"
+            // Helper: load a register(ctx) sub-script and invoke it. Same
+            // { module: { exports: {} } } shim used for security_helpers.js.
+            function __loadLayer(relPath) {
+              const __scope = { module: { exports: {} } };
+              Services.scriptloader.loadSubScript(
+                "resource://thunderbird-mcp/mcp_server/" + relPath + "?" + Date.now(),
+                __scope
               );
-              cal = calModule.cal;
-              const { CalEvent: CE } = ChromeUtils.importESModule(
-                "resource:///modules/CalEvent.sys.mjs"
-              );
-              CalEvent = CE;
-              const { CalTodo: CT } = ChromeUtils.importESModule(
-                "resource:///modules/CalTodo.sys.mjs"
-              );
-              CalTodo = CT;
-            } catch {
-              // Calendar not available
+              __scope.module.exports(ctx);
             }
 
-            let GlodaMsgSearcher = null;
-            try {
-              const glodaModule = ChromeUtils.importESModule(
-                "resource:///modules/gloda/GlodaMsgSearcher.sys.mjs"
-              );
-              GlodaMsgSearcher = glodaModule.GlodaMsgSearcher;
-            } catch {
-              // Gloda not available
+            // 1) Infrastructure (cross-cutting), in dependency order.
+            for (const __m of [
+              "infrastructure/services.js",
+              "infrastructure/connection.js",
+              "infrastructure/auth.js",
+              "infrastructure/audit.js",
+              "infrastructure/access.js",
+              "infrastructure/dispatch.js",
+            ]) {
+              __loadLayer(__m);
             }
 
-            /**
-             * CRITICAL: Must specify { charset: "UTF-8" } or emojis/special chars
-             * will be corrupted. NetUtil defaults to Latin-1.
-             */
-            function readRequestBody(request) {
-              const stream = request.bodyInputStream;
-              return NetUtil.readInputStreamToString(stream, stream.available(), { charset: "UTF-8" });
-            }
-
-            /**
-             * Apply offset-based pagination to a sorted results array.
-             * Removes the internal _dateTs property from each result.
-             *
-             * Backward-compatible: when offset is undefined/null (not provided),
-             * returns a plain array. When offset is explicitly provided (even 0),
-             * returns structured { messages, totalMatches, offset, limit, hasMore }.
-             * Note: totalMatches is capped at SEARCH_COLLECTION_CAP and may underreport.
-             */
-            function paginate(results, offset, effectiveLimit) {
-              const offsetProvided = offset !== undefined && offset !== null;
-              const effectiveOffset = (offset > 0) ? Math.floor(offset) : 0;
-              const page = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(r => {
-                delete r._dateTs;
-                return r;
-              });
-              if (!offsetProvided) {
-                return page;
-              }
-              return {
-                messages: page,
-                totalMatches: results.length,
-                offset: effectiveOffset,
-                limit: effectiveLimit,
-                hasMore: effectiveOffset + effectiveLimit < results.length
-              };
-            }
-
-            /**
-             * Write connection info (port + auth token) to a well-known file
-             * so the bridge can discover how to connect.
-             * File: <TmpD>/thunderbird-mcp/connection.json
-             */
-            function writeConnectionInfo(port, token) {
-              const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-              tmpDir.append("thunderbird-mcp");
-              if (!tmpDir.exists()) {
-                tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
-              } else if (tmpDir.isSymlink()) {
-                throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
-              } else {
-                // POSIX hardening: on a shared /tmp another local user could
-                // pre-create the directory with group/world bits set, then race
-                // the connection file. The O_EXCL on the file itself blocks a
-                // straight overwrite, but a permissive directory still lets the
-                // attacker read or rename our file. Force perms back to 0o700.
-                //
-                // Windows uses ACLs, not POSIX modes. The bits reported by
-                // nsIFile.permissions on Windows do not correspond to the
-                // group/world semantics this check assumes -- a normal Temp
-                // subfolder reads as 0o666 or similar and trips a false
-                // positive. Skip the chmod entirely on Windows; the POSIX
-                // attack model (shared /tmp other-user race) does not apply
-                // there anyway since %LOCALAPPDATA%\Temp is per-user.
-                const isWindows = (() => {
-                  try { return Services.appinfo.OS === "WINNT"; } catch { return false; }
-                })();
-                if (!isWindows) {
-                  try {
-                    const mode = tmpDir.permissions;
-                    if (mode && (mode & 0o077) !== 0) {
-                      try { tmpDir.permissions = 0o700; } catch { /* best-effort */ }
-                      if ((tmpDir.permissions & 0o077) !== 0) {
-                        throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
-                      }
-                    }
-                  } catch (e) {
-                    if (e && e.message && e.message.startsWith("thunderbird-mcp tmp directory")) throw e;
-                    // ignore: permissions accessor unsupported on this platform
-                  }
-                }
-              }
-              const connFile = tmpDir.clone();
-              connFile.append("connection.json");
-              // Symlink defense: remove any existing file first, then create
-              // with O_CREAT|O_EXCL (0x08|0x80) to fail if a symlink appeared
-              // between remove and create.
-              if (connFile.exists()) {
-                connFile.remove(false);
-              }
-              const data = JSON.stringify({ port, token, pid: Services.appinfo.processID });
-              const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
-                .createInstance(Ci.nsIFileOutputStream);
-              // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x80 = O_EXCL
-              ostream.init(connFile, 0x02 | 0x08 | 0x80, 0o600, 0);
-              const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
-                .createInstance(Ci.nsIConverterOutputStream);
-              converter.init(ostream, "UTF-8");
-              converter.writeString(data);
-              converter.close();
-              return connFile.path;
-            }
-
-            /**
-             * Remove the connection info file on shutdown.
-             */
-            function removeConnectionInfo() {
-              try {
-                const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-                tmpDir.append("thunderbird-mcp");
-                const connFile = tmpDir.clone();
-                connFile.append("connection.json");
-                if (connFile.exists()) {
-                  connFile.remove(false);
-                }
-              } catch {
-                // Best-effort cleanup
-              }
-            }
-
-            const authToken = getStableAuthTokenPref() || generateAuthToken();
-
-            /**
-             * Constant-time string comparison to prevent timing side-channel attacks.
-             */
-            function timingSafeEqual(a, b) {
-              const aStr = String(a);
-              const bStr = String(b);
-              const len = Math.max(aStr.length, bStr.length);
-              let result = aStr.length ^ bStr.length;
-              for (let i = 0; i < len; i++) {
-                result |= (aStr.charCodeAt(i) || 0) ^ (bStr.charCodeAt(i) || 0);
-              }
-              return result === 0;
-            }
-
-            // Audit-log cap before rotation. 5 MB of JSON lines is roughly
-            // 10k-30k compose events depending on subject length; rotating to
-            // a single `.log.1` keeps disk use bounded without losing history.
-            const AUDIT_LOG_ROTATE_BYTES = 5 * 1024 * 1024;
-            const AUDIT_LOG_SUBDIR = "thunderbird-mcp";
-            const AUDIT_LOG_FILENAME = "audit.log";
-            const AUDIT_LOG_ROTATED_FILENAME = "audit.log.1";
-
-            /**
-             * Append a single JSON line describing an outbound-compose action
-             * (sendMail / replyToMessage / forwardMessage / saveDraft) to
-             * <ProfD>/thunderbird-mcp/audit.log. Best-effort: any failure is
-             * swallowed so disk errors never block a legitimate send.
-             *
-             * Logged fields are metadata only -- no body, no attachment
-             * content, no recipient lists beyond counts. The whole point is
-             * incident response, not message archival.
-             */
-            function appendComposeAudit(entry) {
-              try {
-                const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
-                const auditDir = profDir.clone();
-                auditDir.append(AUDIT_LOG_SUBDIR);
-                if (!auditDir.exists()) {
-                  auditDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
-                }
-
-                const logFile = auditDir.clone();
-                logFile.append(AUDIT_LOG_FILENAME);
-
-                // Rotate when the active log exceeds the cap.
-                if (logFile.exists()) {
-                  let size = 0;
-                  try { size = logFile.fileSize; } catch { size = 0; }
-                  if (size > AUDIT_LOG_ROTATE_BYTES) {
-                    const rotated = auditDir.clone();
-                    rotated.append(AUDIT_LOG_ROTATED_FILENAME);
-                    if (rotated.exists()) {
-                      try { rotated.remove(false); } catch { /* best-effort */ }
-                    }
-                    try { logFile.moveTo(auditDir, AUDIT_LOG_ROTATED_FILENAME); } catch { /* best-effort */ }
-                  }
-                }
-
-                const line = JSON.stringify({
-                  ts: new Date().toISOString(),
-                  ...entry,
-                }) + "\n";
-
-                const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
-                  .createInstance(Ci.nsIFileOutputStream);
-                // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x10 = O_APPEND
-                ostream.init(logFile, 0x02 | 0x08 | 0x10, 0o600, 0);
-                const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
-                  .createInstance(Ci.nsIConverterOutputStream);
-                converter.init(ostream, "UTF-8");
-                converter.writeString(line);
-                converter.close();
-              } catch (e) {
-                // Audit failure must never block a send. Surface it once on the
-                // console and move on; do NOT propagate.
-                try { console.warn("thunderbird-mcp: audit log write failed:", e); } catch { /* ignore */ }
-              }
-            }
-
-            // summarizeAttachmentsForAudit + countRecipients live in
-            // security_helpers.js; loaded above and destructured into scope.
-
-            /**
-             * Read the audit log file(s) and return parsed JSON entries newest-
-             * first. Reads both audit.log and audit.log.1 if rotation happened
-             * so the caller sees the full bounded history.
-             *
-             * Returns { entries, totalScanned, truncated, errors }:
-             *   - entries: array of parsed log objects (most recent first)
-             *   - totalScanned: number of bytes read
-             *   - truncated: true if maxEntries cut the list
-             *   - errors: per-line parse failures (object with line + reason)
-             *
-             * filter is optional: { tool, since, until } where since/until are
-             * ISO timestamps and tool is an exact name match.
-             */
-            function readAuditLog(maxEntries, filter) {
-              const limit = Number.isFinite(maxEntries) && maxEntries > 0
-                ? Math.min(Math.floor(maxEntries), 10000)
-                : 500;
-              const wantTool = filter && typeof filter.tool === "string" ? filter.tool : null;
-              const sinceTs = filter && filter.since ? Date.parse(filter.since) : null;
-              const untilTs = filter && filter.until ? Date.parse(filter.until) : null;
-
-              const out = { entries: [], totalScanned: 0, truncated: false, errors: [] };
-              const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
-              const auditDir = profDir.clone();
-              auditDir.append(AUDIT_LOG_SUBDIR);
-              if (!auditDir.exists()) return out;
-
-              // Read the active log first, then the rotated one. Newest-first
-              // means we read each file end-to-end, parse, reverse the file's
-              // entries, then append. The rotated file (.log.1) is older.
-              const fileNames = [AUDIT_LOG_FILENAME, AUDIT_LOG_ROTATED_FILENAME];
-              for (const fname of fileNames) {
-                if (out.entries.length >= limit) {
-                  out.truncated = true;
-                  break;
-                }
-                const f = auditDir.clone();
-                f.append(fname);
-                if (!f.exists()) continue;
-                let text = "";
-                try {
-                  const fis = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
-                  fis.init(f, 0x01, 0, 0);
-                  const cis = Cc["@mozilla.org/intl/converter-input-stream;1"].createInstance(Ci.nsIConverterInputStream);
-                  cis.init(fis, "UTF-8", 0, 0);
-                  const buf = {};
-                  let read;
-                  while ((read = cis.readString(65536, buf)) > 0) {
-                    text += buf.value;
-                  }
-                  cis.close();
-                  out.totalScanned += text.length;
-                } catch (e) {
-                  out.errors.push({ file: fname, reason: String(e) });
-                  continue;
-                }
-                const lines = text.split("\n");
-                // Reverse so newest-first; skip empty trailing line.
-                for (let i = lines.length - 1; i >= 0; i--) {
-                  const line = lines[i];
-                  if (!line) continue;
-                  let parsed;
-                  try { parsed = JSON.parse(line); }
-                  catch { out.errors.push({ line: line.slice(0, 80), reason: "parse failure" }); continue; }
-                  if (wantTool && parsed.tool !== wantTool) continue;
-                  if (sinceTs && parsed.ts && Date.parse(parsed.ts) < sinceTs) continue;
-                  if (untilTs && parsed.ts && Date.parse(parsed.ts) > untilTs) continue;
-                  out.entries.push(parsed);
-                  if (out.entries.length >= limit) {
-                    out.truncated = true;
-                    break;
-                  }
-                }
-              }
-              return out;
-            }
-
-            // Idempotency window: how far back to scan for a matching key
-            // before considering the new call a fresh send.
-            const IDEMPOTENCY_WINDOW_HOURS = 24;
-
-            /**
-             * Find a recent successful audit entry whose idempotencyKey
-             * matches `key`. Returns the entry's stored `result` object, or
-             * null if no match. Used by sendMail / replyToMessage /
-             * forwardMessage to skip duplicate sends after a crash or retry.
-             *
-             * Only entries with .success === true are considered hits --
-             * a previous error MUST allow the caller to retry.
-             */
-            function findIdempotentEntry(tool, key) {
-              if (typeof key !== "string" || !key) return null;
-              if (key.length > 256) return null; // schema caps caller input
-              const since = new Date(Date.now() - IDEMPOTENCY_WINDOW_HOURS * 3600 * 1000).toISOString();
-              const log = readAuditLog(1000, { tool, since });
-              for (const e of log.entries) {
-                if (e && e.idempotencyKey === key && e.success === true && e.result) {
-                  return e.result;
-                }
-              }
-              return null;
-            }
-
-            /**
-             * Truncate both audit.log and audit.log.1. Returns the number of
-             * bytes deleted. Best-effort; missing files are silent successes.
-             */
-            function clearAuditLog() {
-              let bytesRemoved = 0;
-              try {
-                const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
-                const auditDir = profDir.clone();
-                auditDir.append(AUDIT_LOG_SUBDIR);
-                if (!auditDir.exists()) return { success: true, bytesRemoved: 0 };
-                for (const fname of [AUDIT_LOG_FILENAME, AUDIT_LOG_ROTATED_FILENAME]) {
-                  const f = auditDir.clone();
-                  f.append(fname);
-                  if (f.exists()) {
-                    try { bytesRemoved += f.fileSize; } catch { /* ignore */ }
-                    try { f.remove(false); } catch { /* ignore */ }
-                  }
-                }
-              } catch (e) {
-                return { error: String(e), bytesRemoved };
-              }
-              return { success: true, bytesRemoved };
-            }
-
-            // Pref-read cache. Services.prefs is hit on every tool dispatch
-            // (rate-limit, access-control, safeguards) and the cost adds up
-            // under search bursts. We cache the parsed value behind each
-            // pref name and register one observer per pref that flips the
-            // cached entry to undefined on change, forcing a re-read next
-            // call. Cheap: a few microseconds saved per call, but matters
-            // for batch tools like batchGetMessageHeaders.
-            const __prefCache = Object.create(null);
-            const __prefObservers = Object.create(null);
-
-            function __invalidatePrefCache(prefName) {
-              return {
-                observe(subject, topic, data) {
-                  if (topic === "nsPref:changed" && data === prefName) {
-                    delete __prefCache[prefName];
-                  }
-                },
-              };
-            }
-            function __ensurePrefObserver(prefName) {
-              if (__prefObservers[prefName]) return;
-              const obs = __invalidatePrefCache(prefName);
-              try {
-                Services.prefs.addObserver(prefName, obs, false);
-                __prefObservers[prefName] = obs;
-              } catch (e) {
-                console.warn("thunderbird-mcp: pref observer registration failed for", prefName, e);
-              }
-            }
-            function __cachedRead(prefName, reader) {
-              __ensurePrefObserver(prefName);
-              if (__prefCache[prefName] !== undefined) return __prefCache[prefName];
-              const value = reader();
-              __prefCache[prefName] = value;
-              return value;
-            }
-
-            /**
-             * Get the list of allowed account IDs from preferences.
-             * Returns an empty array if no restriction is set (all accounts allowed).
-             */
-            function getAllowedAccountIds() {
-              return __cachedRead(PREF_ALLOWED_ACCOUNTS, () => {
-                try {
-                  const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
-                  if (!pref) return [];
-                  const parsed = JSON.parse(pref);
-                  if (!Array.isArray(parsed)) {
-                    console.error("thunderbird-mcp: allowed accounts pref is not an array, blocking all accounts");
-                    return ["__invalid__"];
-                  }
-                  return parsed;
-                } catch (e) {
-                  // Fail closed: corrupt pref means block all accounts, not allow all
-                  console.error("thunderbird-mcp: failed to parse allowed accounts pref, blocking all accounts:", e);
-                  return ["__invalid__"];
-                }
-              });
-            }
-
-            /**
-             * Check if an account is accessible based on the allowed accounts list.
-             * When the list is empty, all accounts are accessible (default).
-             */
-            function isAccountAllowed(accountKey) {
-              const allowed = getAllowedAccountIds();
-              if (allowed.length === 0) return true;
-              return allowed.includes(accountKey);
-            }
-
-            /**
-             * Check if the user has disabled the skipReview shortcut.
-             * When true, send/reply/forward/createEvent/createTask tools must open
-             * the review window/dialog even if the caller passed skipReview: true.
-             *
-             * Default is true: an LLM that reads attacker-controlled email content
-             * can be prompt-injected into invoking sendMail with skipReview, so the
-             * safe default is to require human review. Users can explicitly opt
-             * into silent sends from the options page.
-             */
-            function isSkipReviewBlocked() {
-              return __cachedRead(PREF_BLOCK_SKIPREVIEW, () => {
-                try { return Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, true); }
-                catch { return true; }
-              });
-            }
-
-            /**
-             * Check if the user has blocked `forward` and `reply` filter actions
-             * from the MCP API. Filters execute on every incoming message with
-             * no UI, so allowing an MCP caller to create one is equivalent to
-             * giving the LLM write access to a persistent silent-exfil channel.
-             * Default true.
-             */
-            function isFilterForwardReplyBlocked() {
-              return __cachedRead(PREF_BLOCK_FILTER_FORWARD_REPLY, () => {
-                try { return Services.prefs.getBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, true); }
-                catch { return true; }
-              });
-            }
-
-            /**
-             * Check if the user has blocked address-book write operations from
-             * the MCP API (createContact / updateContact / deleteContact).
-             * Contact writes are persistent, cross every configured address
-             * book, and have no UI confirmation -- enabling a "spoof a known
-             * sender" attack where the LLM edits Boss's email to attacker's.
-             * Default true.
-             */
-            function isContactWritesBlocked() {
-              return __cachedRead(PREF_BLOCK_CONTACT_WRITES, () => {
-                try { return Services.prefs.getBoolPref(PREF_BLOCK_CONTACT_WRITES, true); }
-                catch { return true; }
-              });
-            }
-
-            /**
-             * Check if bulk mailbox export is blocked. Default true:
-             * exportMailbox writes the user's mail content to disk in a
-             * machine-readable format, which is an attractive primitive for
-             * an LLM that has been prompt-injected into "back up everything
-             * I have". Off-by-pref keeps it from being a one-call data
-             * exfil channel.
-             */
-            function isMailboxExportBlocked() {
-              return __cachedRead(PREF_BLOCK_MAILBOX_EXPORT, () => {
-                try { return Services.prefs.getBoolPref(PREF_BLOCK_MAILBOX_EXPORT, true); }
-                catch { return true; }
-              });
-            }
-
-            /**
-             * Get the list of disabled tool names from preferences.
-             * Returns an empty array if no tools are disabled (all enabled).
-             * Fails closed: corrupt pref disables all tools.
-             */
-            function getDisabledTools() {
-              return __cachedRead(PREF_DISABLED_TOOLS, () => {
-                try {
-                  const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
-                  if (!pref) return [];
-                  const parsed = JSON.parse(pref);
-                  if (!Array.isArray(parsed) || !parsed.every(v => typeof v === "string")) {
-                    console.error("thunderbird-mcp: disabled tools pref is invalid, disabling all tools");
-                    return ["__all__"];
-                  }
-                  return parsed;
-                } catch (e) {
-                  console.error("thunderbird-mcp: failed to parse disabled tools pref, disabling all tools:", e);
-                  return ["__all__"];
-                }
-              });
-            }
-
-            /**
-             * Check if a tool is enabled.
-             * Undisableable tools (listAccounts, listFolders, getAccountAccess) always return true.
-             */
-            function isToolEnabled(toolName) {
-              if (UNDISABLEABLE_TOOLS.has(toolName)) return true;
-              const disabled = getDisabledTools();
-              if (disabled.includes("__all__")) return false;
-              return !disabled.includes(toolName);
-            }
-
-            /**
-             * Check if a resolved folder belongs to an allowed account.
-             * Returns true if the folder's account is accessible, false otherwise.
-             */
-            function isFolderAccessible(folder) {
-              if (!folder || !folder.server) return false;
-              const account = MailServices.accounts.findAccountForServer(folder.server);
-              return account ? isAccountAllowed(account.key) : false;
-            }
-
-            /**
-             * Lookup a folder by URI and verify it exists and is accessible.
-             * Returns { folder } on success, or { error } if not found or restricted.
-             */
-            function getAccessibleFolder(folderPath) {
-              const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-              if (!folder) return { error: `Folder not found: ${folderPath}` };
-              if (!isFolderAccessible(folder)) return { error: `Account not accessible for folder: ${folderPath}` };
-              return { folder };
-            }
-
-            /**
-             * Get all accessible Thunderbird accounts, filtered by allowed list.
-             */
-            function getAccessibleAccounts() {
-              const result = [];
-              for (const account of MailServices.accounts.accounts) {
-                if (isAccountAllowed(account.key)) {
-                  result.push(account);
-                }
-              }
-              return result;
-            }
-
-            function listAccounts() {
-              const accounts = [];
-              for (const account of getAccessibleAccounts()) {
-                const server = account.incomingServer;
-                const identities = [];
-                for (const identity of account.identities) {
-                  identities.push({
-                    id: identity.key,
-                    email: identity.email,
-                    name: identity.fullName,
-                    isDefault: identity === account.defaultIdentity
-                  });
-                }
-                accounts.push({
-                  id: account.key,
-                  name: server.prettyName,
-                  type: server.type,
-                  identities
-                });
-              }
-              return accounts;
-            }
-
-            /**
-             * Get the current account access control list.
-             */
-            function getAccountAccess() {
-              const allowed = getAllowedAccountIds();
-              // Only return accessible accounts — restricted accounts are hidden
-              const accessibleAccounts = [];
-              for (const account of MailServices.accounts.accounts) {
-                if (!isAccountAllowed(account.key)) continue;
-                const server = account.incomingServer;
-                accessibleAccounts.push({
-                  id: account.key,
-                  name: server.prettyName,
-                  type: server.type,
-                });
-              }
-              return {
-                mode: allowed.length === 0 ? "all" : "restricted",
-                accounts: accessibleAccounts,
-              };
-            }
-
-            /**
-             * Lists all folders (optionally limited to a single account).
-             * Depth is 0 for root children, increasing for subfolders.
-             */
-            function listFolders(accountId, folderPath) {
-              const results = [];
-
-              function folderType(flags) {
-                if (flags & 0x00001000) return "inbox";
-                if (flags & 0x00000200) return "sent";
-                if (flags & 0x00000400) return "drafts";
-                if (flags & 0x00000100) return "trash";
-                if (flags & 0x00400000) return "templates";
-                if (flags & 0x00000800) return "queue";
-                if (flags & 0x40000000) return "junk";
-                if (flags & 0x00004000) return "archive";
-                return "folder";
-              }
-
-              function walkFolder(folder, accountKey, depth) {
-                try {
-                  // Skip virtual/search folders to avoid duplicates
-                  if (folder.flags & 0x00000020) return;
-
-                  const prettyName = folder.prettyName;
-                  results.push({
-                    name: prettyName || folder.name || "(unnamed)",
-                    path: folder.URI,
-                    type: folderType(folder.flags),
-                    accountId: accountKey,
-                    totalMessages: folder.getTotalMessages(false),
-                    unreadMessages: folder.getNumUnread(false),
-                    depth
-                  });
-                } catch {
-                  // Skip inaccessible folders
-                }
-
-                try {
-                  if (folder.hasSubFolders) {
-                    for (const subfolder of folder.subFolders) {
-                      walkFolder(subfolder, accountKey, depth + 1);
-                    }
-                  }
-                } catch {
-                  // Skip subfolder traversal errors
-                }
-              }
-
-              // folderPath filter: list that folder and its subtree
-              if (folderPath) {
-                const result = getAccessibleFolder(folderPath);
-                if (result.error) return result;
-                const folder = result.folder;
-                const accountKey = folder.server
-                  ? (MailServices.accounts.findAccountForServer(folder.server)?.key || "unknown")
-                  : "unknown";
-                walkFolder(folder, accountKey, 0);
-                return results;
-              }
-
-              if (accountId) {
-                if (!isAccountAllowed(accountId)) {
-                  return { error: `Account not accessible: ${accountId}` };
-                }
-                let target = null;
-                for (const account of MailServices.accounts.accounts) {
-                  if (account.key === accountId) {
-                    target = account;
-                    break;
-                  }
-                }
-                if (!target) {
-                  return { error: `Account not found: ${accountId}` };
-                }
-                try {
-                  const root = target.incomingServer.rootFolder;
-                  if (root && root.hasSubFolders) {
-                    for (const subfolder of root.subFolders) {
-                      walkFolder(subfolder, target.key, 0);
-                    }
-                  }
-                } catch {
-                  // Skip inaccessible account
-                }
-                return results;
-              }
-
-              for (const account of getAccessibleAccounts()) {
-                try {
-                  const root = account.incomingServer.rootFolder;
-                  if (!root) continue;
-                  if (root.hasSubFolders) {
-                    for (const subfolder of root.subFolders) {
-                      walkFolder(subfolder, account.key, 0);
-                    }
-                  }
-                } catch {
-                  // Skip inaccessible accounts/folders
-                }
-              }
-
-              return results;
-            }
-
-            /** Returns user-visible tag keywords from a message header, filtering out internal IMAP flags. */
-            function getUserTags(msgHdr) {
-              return (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
-            }
-
-            function stripHtml(html) {
-              if (!html) return "";
-              let text = String(html);
-
-              // Remove style/script blocks
-              text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ");
-              text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ");
-
-              // Convert block-level tags to newlines before stripping
-              text = text.replace(/<br\s*\/?>/gi, "\n");
-              text = text.replace(/<\/(p|div|li|tr|h[1-6]|blockquote|pre)>/gi, "\n");
-              text = text.replace(/<(p|div|li|tr|h[1-6]|blockquote|pre)\b[^>]*>/gi, "\n");
-
-              // Strip remaining tags
-              text = text.replace(/<[^>]+>/g, " ");
-
-              // Decode entities in a single pass
-              const NAMED_ENTITIES = {
-                nbsp: " ", amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'",
-                "#39": "'",
-                mdash: "\u2014", ndash: "\u2013", hellip: "\u2026",
-                lsquo: "\u2018", rsquo: "\u2019", ldquo: "\u201C", rdquo: "\u201D",
-                bull: "\u2022", middot: "\u00B7", ensp: "\u2002", emsp: "\u2003",
-                thinsp: "\u2009", zwnj: "\u200C", zwj: "\u200D",
-                laquo: "\u00AB", raquo: "\u00BB",
-                copy: "\u00A9", reg: "\u00AE", trade: "\u2122", deg: "\u00B0",
-                plusmn: "\u00B1", times: "\u00D7", divide: "\u00F7",
-                micro: "\u00B5", para: "\u00B6", sect: "\u00A7",
-                euro: "\u20AC", pound: "\u00A3", yen: "\u00A5", cent: "\u00A2",
-              };
-              text = text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/gi, (match, entity) => {
-                if (entity.startsWith("#x") || entity.startsWith("#X")) {
-                  const cp = parseInt(entity.slice(2), 16);
-                  if (!cp || cp > 0x10FFFF) return match;
-                  try { return String.fromCodePoint(cp); } catch { return match; }
-                }
-                if (entity.startsWith("#")) {
-                  const cp = parseInt(entity.slice(1), 10);
-                  if (!cp || cp > 0x10FFFF) return match;
-                  try { return String.fromCodePoint(cp); } catch { return match; }
-                }
-                return NAMED_ENTITIES[entity.toLowerCase()] || match;
-              });
-
-              // Normalize newlines/spaces
-              text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-              text = text.replace(/\n{3,}/g, "\n\n");
-              text = text.replace(/[ \t\f\v]+/g, " ");
-              text = text.replace(/ *\n */g, "\n");
-              text = text.trim();
-              return text;
-            }
-
-            // SAFE_HREF_SCHEMES lives in security_helpers.js.
-
-            // isSafeMarkdownHref / isSafeImageSrc / escapeMarkdownLinkText /
-            // renderMarkdownLink live in security_helpers.js.
-
-            /**
-             * Walks the MIME tree to find the raw body content.
-             * Returns { text, isHtml } without any format conversion.
-             * Does NOT use coerceBodyToPlaintext -- callers that want
-             * the raw HTML (for markdown/html output) need this.
-             */
-            function extractBodyContent(aMimeMsg) {
-              if (!aMimeMsg) return { text: "", isHtml: false };
-              try {
-                function findBody(part, isRoot = false) {
-                  const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
-                  if (ct === "message/rfc822" && !isRoot) return null;
-                  if (ct !== "message/rfc822") {
-                    if (ct === "text/plain" && part.body) return { text: part.body, isHtml: false };
-                    if (ct === "text/html" && part.body) return { text: part.body, isHtml: true };
-                  }
-                  if (part.parts) {
-                    let htmlFallback = null;
-                    for (const sub of part.parts) {
-                      const r = findBody(sub);
-                      if (r && !r.isHtml) return r;
-                      if (r && r.isHtml && !htmlFallback) htmlFallback = r;
-                    }
-                    if (htmlFallback) return htmlFallback;
-                  }
-                  return null;
-                }
-                const found = findBody(aMimeMsg, true);
-                if (found) return found;
-              } catch { /* give up */ }
-              return { text: "", isHtml: false };
-            }
-
-            /**
-             * Extracts plain text body from a MIME message.
-             * Uses coerceBodyToPlaintext as fast path, then MIME tree fallback.
-             * Used by reply/forward quoting where plain text is appropriate.
-             */
-            function extractPlainTextBody(aMimeMsg) {
-              if (!aMimeMsg) return "";
-              try {
-                const text = aMimeMsg.coerceBodyToPlaintext();
-                if (text) return text;
-              } catch { /* fall through */ }
-              const { text, isHtml } = extractBodyContent(aMimeMsg);
-              return isHtml ? stripHtml(text) : text;
-            }
+            // Pull the infra bindings the rest of start() uses by bare name.
+            const {
+              HttpServer, NetUtil, MailServices,
+              cal, CalEvent, CalTodo, GlodaMsgSearcher,
+              readRequestBody, paginate,
+              writeConnectionInfo, removeConnectionInfo, timingSafeEqual,
+              authToken,
+              AUDIT_LOG_SUBDIR, AUDIT_LOG_FILENAME,
+              appendComposeAudit, readAuditLog, findIdempotentEntry, clearAuditLog,
+              consumeRateLimitFor, inspectRateLimitsState,
+              getAllowedAccountIds, isAccountAllowed, isSkipReviewBlocked,
+              isFilterForwardReplyBlocked, isContactWritesBlocked, isMailboxExportBlocked,
+              getDisabledTools, isToolEnabled, isFolderAccessible, getAccessibleFolder,
+              getAccessibleAccounts, listAccounts, getAccountAccess, listFolders,
+              getUserTags, stripHtml, extractBodyContent, extractPlainTextBody,
+              toolSchemas, validateToolArgs, coerceToolArgs, callTool,
+            } = ctx;
 
             // UNTRUSTED_OPEN/CLOSE + wrapUntrustedBody/Preview live in security_helpers.js.
 
@@ -2122,192 +1378,83 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 accessibleAccounts,
                 accessMode: getAllowedAccountIds().length === 0 ? "all" : "restricted",
                 safeguards,
-                rateLimits: inspectRateLimits(__rateLimiterState),
+                rateLimits: inspectRateLimitsState(),
                 auditLogPath: `<ProfD>/${AUDIT_LOG_SUBDIR}/${AUDIT_LOG_FILENAME}`,
               };
             }
 
-            /**
-             * Build a lookup from tool name to inputSchema for fast validation.
-             */
-            const toolSchemas = Object.create(null);
-            for (const t of tools) {
-              toolSchemas[t.name] = t.inputSchema;
-            }
-
-            /**
-             * Validate tool arguments against the tool's inputSchema.
-             * Checks required fields, types (string, number, boolean, array, object),
-             * and rejects unknown properties.
-             * Returns an array of error strings (empty = valid).
-             */
-            // validateAgainstSchema lives in security_helpers.js.
+            // Shared body/folder/message helpers defined above in start()
+            // (openFolder, findMessage, stripHtml, extractBodyContent,
+            // extractPlainTextBody) plus the infra helpers and state are now
+            // exposed on ctx for the domain modules to consume. The temp-
+            // attachment / timer / claimed-window state stays owned here
+            // because the shutdown cleanup (outside start) drains it.
+            Object.assign(ctx, {
+              openFolder, findMessage,
+            });
 
             // ── Domain module wiring ──
             //
-            // The contacts, calendar, filters, mail, and compose tool
-            // implementations live in mcp_server/domain/*.js. They are loaded
-            // here with the same loadSubScript + module.exports shim used for
-            // security_helpers.js, because a WebExtension Experiment API loads a
-            // single parent script (this file) and supports neither a
-            // multi-script list nor ES module import. Each module exports
-            // register(ctx): it reads the shared bindings it needs from ctx and
-            // assigns its tool functions back onto ctx. We load them at this
-            // point -- after every shared constant, XPCOM binding, and infra
-            // helper is in scope -- then pull the tool functions into local
-            // scope so the dispatch switch below can call them by their original
-            // bare names.
+            // Every domain is now fully migrated to the deep-DDD 4-layer split:
+            // pure entity → infrastructure adapter (XPCOM) → application service
+            // (orchestration) → interface tools (thin handlers). Each interface
+            // module registers its handlers into the dispatch registry via
+            // ctx.registerToolHandler, so callTool() routes them there. The
+            // legacyCallTool switch below now serves ONLY the cross-cutting
+            // account/system tools (listAccounts, listFolders, getAccountAccess,
+            // getServerCapabilities, getAuditLog) that belong to no domain.
             //
-            // The shared body/folder/message helpers (stripHtml,
-            // extractBodyContent, extractPlainTextBody, openFolder, findMessage)
-            // stay in api.js because BOTH mail and compose need them; they are
-            // passed through ctx. The temp-attachment / timer / claimed-window
-            // state objects also stay here because the shutdown cleanup below
-            // (outside this block) still has to drain _tempAttachFiles.
-            const __domainCtx = {
-              Cc, Ci, Services, MailServices, NetUtil,
-              cal, CalEvent, CalTodo, GlodaMsgSearcher,
-              MAX_SEARCH_RESULTS_CAP, DEFAULT_MAX_RESULTS, AUDIT_LOG_SUBDIR,
-              appendComposeAudit, findIdempotentEntry,
-              isContactWritesBlocked, isSkipReviewBlocked,
-              isFilterForwardReplyBlocked, isAccountAllowed,
-              isFolderAccessible, isMailboxExportBlocked,
-              getAccessibleFolder, getAccessibleAccounts,
-              paginate, getUserTags,
-              openFolder, findMessage,
-              stripHtml, extractBodyContent, extractPlainTextBody,
-              isSensitiveFilePath, sanitizeHeaderLine, countRecipients,
-              isSafeImageSrc, isSafeMarkdownHref, isSystemPrincipalFetchAllowed,
-              escapeMarkdownLinkText, renderMarkdownLink,
-              wrapUntrustedBody, wrapUntrustedPreview,
-              _attachTimers, _tempAttachFiles, _claimedComposeWindows,
-            };
-            for (const __mod of ["domain/contacts.js", "domain/calendar.js", "domain/filters.js", "domain/mail.js", "domain/compose.js"]) {
-              const __scope = { module: { exports: {} } };
-              Services.scriptloader.loadSubScript(
-                "resource://thunderbird-mcp/mcp_server/" + __mod + "?" + Date.now(),
-                __scope
-              );
-              __scope.module.exports(__domainCtx);
-            }
-            const {
-              searchContacts, createContact, updateContact, deleteContact,
-              listCalendars, createEvent, listEvents, updateEvent, deleteEvent,
-              listCategories, createTask, listTasks, updateTask,
-              listFilters, createFilter, updateFilter, deleteFilter,
-              reorderFilters, applyFilters,
-              searchMessages, getMessage, getMessageHeaders, getRecentMessages,
-              batchGetMessageHeaders, searchByThread, searchAttachments,
-              getSenderHistory, displayMessage, updateMessage, deleteMessages,
-              createFolder, renameFolder, deleteFolder, moveFolder,
-              emptyTrash, emptyJunk, refreshFolder, exportMailbox,
-              composeMail, replyToMessage, forwardMessage, saveDraft,
-              dryRunCompose, listTemplates, renderTemplate,
-            } = __domainCtx;
-
-            function validateToolArgs(name, args) {
-              const schema = toolSchemas[name];
-              if (!schema) return [`Unknown tool: ${name}`];
-
-              const errors = [];
-              const props = schema.properties || {};
-              const required = schema.required || [];
-
-              // Check required fields
-              for (const key of required) {
-                if (args[key] === undefined || args[key] === null) {
-                  errors.push(`Missing required parameter: ${key}`);
-                }
-              }
-
-              // Check types and reject unknown properties
-              for (const [key, value] of Object.entries(args)) {
-                // Use hasOwnProperty to prevent inherited properties like
-                // 'constructor' or 'toString' from bypassing unknown-param checks.
-                const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
-                if (!propSchema) {
-                  errors.push(`Unknown parameter: ${key}`);
-                  continue;
-                }
-                if (value === undefined || value === null) continue;
-
-                validateAgainstSchema(value, propSchema, key, errors);
-              }
-
-              return errors;
+            // Load order per domain is dependency order: entity → adapter →
+            // service → tools (a service destructures its adapter+entity off ctx
+            // at register time, so both must already be loaded).
+            for (const __layer of [
+              // contacts (reference domain)
+              "domain/entities/contact.js",
+              "infrastructure/contacts_adapter.js",
+              "application/contacts_service.js",
+              "interface/contacts_tools.js",
+              // mail
+              "domain/entities/message.js",
+              "infrastructure/mail_adapter.js",
+              "application/mail_service.js",
+              "interface/mail_tools.js",
+              // compose (adapter consumes the shutdown state already on ctx;
+              // service consumes findMessage, assigned to ctx above)
+              "domain/entities/compose.js",
+              "infrastructure/compose_adapter.js",
+              "application/compose_service.js",
+              "interface/compose_tools.js",
+              // calendar
+              "domain/entities/calendar.js",
+              "infrastructure/calendar_adapter.js",
+              "application/calendar_service.js",
+              "interface/calendar_tools.js",
+              // filters
+              "domain/entities/filter.js",
+              "infrastructure/filters_adapter.js",
+              "application/filters_service.js",
+              "interface/filters_tools.js",
+            ]) {
+              __loadLayer(__layer);
             }
 
-            /**
-             * Coerce tool arguments to match expected schema types.
-             * MCP clients may send "true"/"false" as strings for booleans,
-             * "50" as strings for numbers, or JSON-encoded arrays as strings.
-             * Mutates and returns the args object.
-             */
-            function coerceToolArgs(name, args) {
-              const schema = toolSchemas[name];
-              if (!schema) return args;
-              const props = schema.properties || {};
-              for (const [key, value] of Object.entries(args)) {
-                if (value === undefined || value === null) continue;
-                const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
-                if (!propSchema) continue;
-                const expected = propSchema.type;
-                if (expected === "boolean" && typeof value === "string") {
-                  if (value === "true") args[key] = true;
-                  else if (value === "false") args[key] = false;
-                } else if (expected === "number" && typeof value === "string") {
-                  // Reject blank/whitespace strings -- Number("") is 0 which
-                  // would silently coerce empty input into a valid number.
-                  if (value.trim() === "") continue;
-                  const n = Number(value);
-                  if (Number.isFinite(n)) args[key] = n;
-                } else if (expected === "integer" && typeof value === "string") {
-                  if (value.trim() === "") continue;
-                  const n = Number(value);
-                  if (Number.isFinite(n) && Number.isInteger(n)) args[key] = n;
-                } else if (expected === "array" && typeof value === "string") {
-                  try {
-                    const parsed = JSON.parse(value);
-                    if (Array.isArray(parsed)) args[key] = parsed;
-                  } catch (e) {
-                    // Leave value as-is so validator surfaces a typed error to the client.
-                    console.warn(`thunderbird-mcp: coerceToolArgs JSON.parse failed for key=${key}:`, e.message);
-                  }
-                }
-              }
-              return args;
-            }
+            // validateToolArgs / coerceToolArgs / toolSchemas now live in
+            // infrastructure/dispatch.js and were destructured from ctx above.
 
-            async function callTool(name, args) {
+            // The legacy dispatch switch: serves only the cross-cutting
+            // account/system tools that belong to no domain. callTool (from
+            // dispatch.js) checks the interface-registered handlers first and
+            // falls back to this. Every domain tool (contacts/mail/compose/
+            // calendar/filters) is intentionally absent — they route through
+            // their registered interface handlers.
+            async function legacyCallTool(name, args) {
               switch (name) {
                 case "listAccounts":
                   return listAccounts();
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
-                case "searchMessages":
-                  return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
-                case "getMessage":
-                  return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
-                case "getMessageHeaders":
-                  return getMessageHeaders(args.messageId, args.folderPath);
-                case "batchGetMessageHeaders":
-                  return batchGetMessageHeaders(args.messageIds, args.folderPath);
-                case "searchByThread":
-                  return searchByThread(args.messageId, args.folderPath, args.maxResults);
-                case "searchAttachments":
-                  return await searchAttachments(args.nameContains, args.contentType, args.folderPath, args.maxResults, args.scanCap);
-                case "getSenderHistory":
-                  return getSenderHistory(args.email, args.maxResults, args.scanCap, args.sinceDays);
-                case "exportMailbox":
-                  return await exportMailbox(args.folderPath, args.maxMessages, args.includeBody, args.includeAttachmentMeta, args.scanCap, args.sortOrder);
-                case "dryRunCompose":
-                  return dryRunCompose(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "getServerCapabilities":
                   return getServerCapabilities();
-                case "listTemplates":
-                  return listTemplates();
-                case "renderTemplate":
-                  return renderTemplate(args.name, args.vars);
                 case "getAuditLog": {
                   const filter = {};
                   if (typeof args.tool === "string") filter.tool = args.tool;
@@ -2316,80 +1463,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const max = typeof args.maxEntries === "number" ? args.maxEntries : 200;
                   return readAuditLog(max, filter);
                 }
-                case "searchContacts":
-                  return searchContacts(args.query || "", args.maxResults);
-                case "createContact":
-                  return createContact(args.email, args.displayName, args.firstName, args.lastName, args.addressBookId);
-                case "updateContact":
-                  return updateContact(args.contactId, args.email, args.displayName, args.firstName, args.lastName);
-                case "deleteContact":
-                  return deleteContact(args.contactId);
-                case "listCalendars":
-                  return listCalendars();
-                case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status);
-                case "listEvents":
-                  return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
-                case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurringScope);
-                case "deleteEvent":
-                  return await deleteEvent(args.eventId, args.calendarId, args.recurringScope);
-                case "listCategories":
-                  return listCategories();
-                case "createTask":
-                  return await createTask(args.title, args.dueDate, args.calendarId, args.description, args.priority, args.categories, args.skipReview);
-                case "listTasks":
-                  return await listTasks(args.calendarId, args.completed, args.dueBefore, args.maxResults);
-                case "updateTask":
-                  return await updateTask(args.taskId, args.calendarId, args.title, args.dueDate, args.description, args.completed, args.percentComplete, args.priority);
-                case "sendMail":
-                  return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview, args.idempotencyKey);
-                case "saveDraft":
-                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
-                case "replyToMessage":
-                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.idempotencyKey);
-                case "forwardMessage":
-                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.idempotencyKey);
-                case "getRecentMessages":
-                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
-                case "refreshFolder":
-                  return await refreshFolder(args.folderPath, args.timeoutMs);
-                case "displayMessage":
-                  return displayMessage(args.messageId, args.folderPath, args.displayMode);
-                case "deleteMessages":
-                  return deleteMessages(args.messageIds, args.folderPath);
-                case "updateMessage":
-                  return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash);
-                case "createFolder":
-                  return createFolder(args.parentFolderPath, args.name);
-                case "renameFolder":
-                  return renameFolder(args.folderPath, args.newName);
-                case "deleteFolder":
-                  return deleteFolder(args.folderPath);
-                case "emptyTrash":
-                  return emptyTrash(args.accountId);
-                case "emptyJunk":
-                  return emptyJunk(args.accountId);
-                case "moveFolder":
-                  return moveFolder(args.folderPath, args.newParentPath);
-                case "listFilters":
-                  return listFilters(args.accountId);
-                case "createFilter":
-                  return createFilter(args.accountId, args.name, args.enabled, args.type, args.conditions, args.actions, args.insertAtIndex);
-                case "updateFilter":
-                  return updateFilter(args.accountId, args.filterIndex, args.name, args.enabled, args.type, args.conditions, args.actions);
-                case "deleteFilter":
-                  return deleteFilter(args.accountId, args.filterIndex);
-                case "reorderFilters":
-                  return reorderFilters(args.accountId, args.fromIndex, args.toIndex);
-                case "applyFilters":
-                  return applyFilters(args.accountId, args.folderPath);
                 case "getAccountAccess":
                   return getAccountAccess();
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
             }
+            // Register the legacy switch as the dispatch fallback. callTool
+            // (destructured from ctx above) consults the interface-registered
+            // handlers first, then this.
+            ctx.legacyCallTool = legacyCallTool;
 
             const server = new HttpServer();
 
@@ -2536,7 +1619,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       // agent stuck in a tight loop is throttled even if it
                       // is sending malformed arguments.
                       {
-                        const rl = consumeRateLimit(__rateLimiterState, params.name);
+                        const rl = consumeRateLimitFor(params.name);
                         if (!rl.allowed) {
                           throw new Error(
                             `Rate limit exceeded for '${params.name}': ` +

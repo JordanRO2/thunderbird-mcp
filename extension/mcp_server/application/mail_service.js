@@ -1,35 +1,38 @@
-/**
- * Mail domain module for the Thunderbird MCP server.
- *
- * Implements the message and folder tools: searchMessages, getMessage,
- * getMessageHeaders, getRecentMessages, batchGetMessageHeaders, searchByThread,
- * searchAttachments, getSenderHistory, displayMessage, updateMessage,
- * deleteMessages, exportMailbox, refreshFolder, and the folder-CRUD tools
- * createFolder / renameFolder / deleteFolder / moveFolder / emptyTrash /
- * emptyJunk -- plus their internal helpers (exportsDir, buildExportFilename,
- * glodaBodySearch, msgHdrToHeaderObject, findTrashFolder, findSpecialFolder,
- * deleteAllMessagesRecursive, htmlToMarkdown, extractFormattedBody) and the
- * export-related constants.
- *
- * The infra tools listAccounts / listFolders / getAccountAccess stay in api.js
- * because they are connection/access-control surface, not message operations.
- *
- * Loaded by api.js via Services.scriptloader.loadSubScript with a
- * { module: { exports: {} } } scope, exactly like security_helpers.js and the
- * other domain modules. register(ctx) destructures the shared dependencies it
- * needs from ctx -- the XPCOM bindings (Cc/Ci/Services/MailServices/NetUtil/
- * GlodaMsgSearcher), the search/result limit constants, the access-control and
- * audit infra helpers, the shared body-extraction helpers (stripHtml,
- * extractBodyContent, extractPlainTextBody) and folder/message lookup helpers
- * (openFolder, findMessage) that COMPOSE also uses, and the untrusted-content
- * sanitizers from security_helpers.js -- then defines the functions verbatim
- * and assigns the tool functions back onto ctx for the dispatch switch.
- *
- * NOTE: function bodies are copied byte-for-byte from the monolithic api.js
- * (original indentation preserved) so runtime behavior is identical.
- */
 "use strict";
 
+/**
+ * application/mail_service.js — mail/folder use-case orchestration.
+ *
+ * This is the body logic that used to live in domain/mail.js's tool functions,
+ * MINUS the leaf XPCOM helpers (now in infrastructure/mail_adapter.js) and the
+ * pure markdown/format helpers (now in domain/entities/message.js). The big
+ * enumeration loops stay here because their date/filter/pagination logic is
+ * inseparable from the loop; the access checks, ordering, audit calls, and
+ * error envelopes are all preserved verbatim from the original.
+ *
+ * The adapter/entity helpers are pulled off ctx and re-bound to their original
+ * bare names (msgHdrToHeaderObject, glodaBodySearch, exportsDir,
+ * buildExportFilename, findTrashFolder, findSpecialFolder,
+ * deleteAllMessagesRecursive, htmlToMarkdown, extractFormattedBody) so the
+ * copied-verbatim function bodies are byte-for-byte identical to api.js.
+ *
+ * Consumes from ctx:
+ *   Cc, Ci, Services, MailServices, NetUtil,
+ *   GlodaMsgSearcher, MAX_SEARCH_RESULTS_CAP, DEFAULT_MAX_RESULTS,
+ *   paginate, appendComposeAudit, getUserTags, isAccountAllowed,
+ *   isMailboxExportBlocked, getAccessibleFolder, getAccessibleAccounts,
+ *   openFolder, findMessage, stripHtml, extractPlainTextBody,
+ *   isSystemPrincipalFetchAllowed, wrapUntrustedPreview,
+ *   mailAdapter, messageEntity
+ * Registers onto ctx:
+ *   mailService = {
+ *     searchMessages, getMessage, getMessageHeaders, getRecentMessages,
+ *     batchGetMessageHeaders, searchByThread, searchAttachments,
+ *     getSenderHistory, displayMessage, updateMessage, deleteMessages,
+ *     createFolder, renameFolder, deleteFolder, moveFolder, emptyTrash,
+ *     emptyJunk, refreshFolder, exportMailbox
+ *   }
+ */
 module.exports = function register(ctx) {
   const {
     Cc,
@@ -40,56 +43,41 @@ module.exports = function register(ctx) {
     GlodaMsgSearcher,
     MAX_SEARCH_RESULTS_CAP,
     DEFAULT_MAX_RESULTS,
-    AUDIT_LOG_SUBDIR,
     paginate,
     appendComposeAudit,
     getUserTags,
     isAccountAllowed,
-    isFolderAccessible,
     isMailboxExportBlocked,
     getAccessibleFolder,
     getAccessibleAccounts,
     openFolder,
     findMessage,
     stripHtml,
-    extractBodyContent,
     extractPlainTextBody,
-    isSafeImageSrc,
-    isSafeMarkdownHref,
     isSystemPrincipalFetchAllowed,
-    escapeMarkdownLinkText,
-    renderMarkdownLink,
-    wrapUntrustedBody,
     wrapUntrustedPreview,
+    mailAdapter,
+    messageEntity,
   } = ctx;
 
-  // ── Export-related constants (used only by the mailbox-export and search
-  // tools, so they live with their consumers rather than in api.js). ──
-  const EXPORTS_SUBDIR = "exports";
+  // Re-bind the relocated helpers to their original bare names so the verbatim
+  // function bodies below are unchanged from the monolithic api.js.
+  const {
+    exportsDir,
+    msgHdrToHeaderObject,
+    findTrashFolder,
+    findSpecialFolder,
+    deleteAllMessagesRecursive,
+    glodaBodySearch,
+  } = mailAdapter;
+  const { htmlToMarkdown, extractFormattedBody, buildExportFilename } = messageEntity;
+
+  // ── Export/search limit constants (used only by the mailbox-export and
+  // search tools, so they live with their consumers rather than in api.js). ──
   const EXPORT_DEFAULT_MAX = 1000;
   const EXPORT_HARD_CAP = 50000;
   const EXPORT_DEFAULT_SCAN_CAP = 50000;
   const SEARCH_COLLECTION_CAP = 10000;
-
-            function exportsDir() {
-              const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
-              const d = profDir.clone();
-              d.append(AUDIT_LOG_SUBDIR);
-              d.append(EXPORTS_SUBDIR);
-              return d;
-            }
-
-            /**
-             * Build a safe destination filename for an export: ISO timestamp
-             * with `:` replaced (Windows-hostile) and a sanitized folder
-             * component derived from the folder URI's tail.
-             */
-            function buildExportFilename(folder) {
-              const ts = new Date().toISOString().replace(/[:]/g, "-");
-              const tail = folder.URI ? folder.URI.split("/").pop() : "folder";
-              const safeTail = String(tail || "folder").replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
-              return `${ts}-${safeTail || "folder"}.jsonl`;
-            }
 
             /**
              * Async streaming export. Resolves once every message has been
@@ -241,117 +229,6 @@ module.exports = function register(ctx) {
                     });
                   }
                   next();
-                } catch (e) {
-                  resolve({ error: e.toString() });
-                }
-              });
-            }
-
-            /**
-             * Full-text body search using Thunderbird's Gloda index via
-             * GlodaMsgSearcher. Searches subject, body, and attachment
-             * names. Returns a Promise resolving to the same format as
-             * searchMessages. IMAP accounts need offline sync for body
-             * indexing; without it only headers are searched.
-             */
-            function glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly) {
-              const requestedLimit = Number(maxResults);
-              const effectiveLimit = Math.min(
-                Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.floor(requestedLimit) : DEFAULT_MAX_RESULTS,
-                MAX_SEARCH_RESULTS_CAP
-              );
-              const normalizedSortOrder = sortOrder === "asc" ? "asc" : "desc";
-              const parsedStartDate = startDate ? new Date(startDate).getTime() : null;
-              const parsedEndDate = endDate ? new Date(endDate).getTime() : null;
-              if (parsedStartDate !== null && isNaN(parsedStartDate)) return { error: `Invalid startDate: ${startDate}` };
-              if (parsedEndDate !== null && isNaN(parsedEndDate)) return { error: `Invalid endDate: ${endDate}` };
-              // Match the regular search path: expand date-only endDate to end of day
-              const isDateOnly = endDate && /^\d{4}-\d{2}-\d{2}$/.test(endDate.trim());
-              const endDateOffset = isDateOnly ? 86400000 : 0;
-              const endDateTs = parsedEndDate !== null ? (parsedEndDate + endDateOffset) * 1000 : null;
-              const startDateTs = parsedStartDate !== null ? parsedStartDate * 1000 : null;
-
-              // Resolve folder filter upfront -- match by URI prefix for subfolder inclusion
-              let folderFilterURI = null;
-              if (folderPath) {
-                const result = getAccessibleFolder(folderPath);
-                if (result.error) return result;
-                folderFilterURI = result.folder.URI;
-              }
-
-              return new Promise((resolve) => {
-                try {
-                  const listener = {
-                    onItemsAdded() {},
-                    onItemsModified() {},
-                    onItemsRemoved() {},
-                    onQueryCompleted(collection) {
-                      try {
-                        const results = [];
-                        for (const glodaMsg of collection.items) {
-                          if (results.length >= SEARCH_COLLECTION_CAP) break;
-                          // Get the underlying msgHdr
-                          let msgHdr;
-                          try {
-                            msgHdr = glodaMsg.folderMessage;
-                          } catch { continue; }
-                          if (!msgHdr) continue;
-
-                          // Account access control
-                          const folder = msgHdr.folder;
-                          if (!folder) continue;
-                          if (!isFolderAccessible(folder)) continue;
-
-                          // Folder filter (URI prefix match includes subfolders)
-                          if (folderFilterURI && !folder.URI.startsWith(folderFilterURI)) continue;
-
-                          // Date filters (timestamps in microseconds)
-                          const msgDateTs = msgHdr.date || 0;
-                          if (startDateTs !== null && msgDateTs < startDateTs) continue;
-                          if (endDateTs !== null && msgDateTs > endDateTs) continue;
-
-                          // Boolean filters
-                          if (unreadOnly && msgHdr.isRead) continue;
-                          if (flaggedOnly && !msgHdr.isFlagged) continue;
-                          if (tag) {
-                            const keywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/);
-                            if (!keywords.includes(tag)) continue;
-                          }
-
-                          const msgTags = getUserTags(msgHdr);
-                          const preview = msgHdr.getStringProperty("preview") || "";
-                          const result = {
-                            id: msgHdr.messageId,
-                            threadId: msgHdr.threadId,
-                            subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
-                            author: msgHdr.mime2DecodedAuthor || msgHdr.author,
-                            recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
-                            ccList: msgHdr.ccList,
-                            date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                            folder: folder.prettyName,
-                            folderPath: folder.URI,
-                            read: msgHdr.isRead,
-                            flagged: msgHdr.isFlagged,
-                            tags: msgTags,
-                            _dateTs: msgDateTs
-                          };
-                          if (preview) result.preview = wrapUntrustedPreview(preview);
-                          results.push(result);
-                        }
-
-                        if (countOnly) {
-                          resolve({ count: results.length });
-                          return;
-                        }
-                        results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
-                        resolve(paginate(results, offset, effectiveLimit));
-                      } catch (e) {
-                        resolve({ error: e.toString() });
-                      }
-                    }
-                  };
-                  const searcher = new GlodaMsgSearcher(listener, query);
-                  searcher.getCollection();
                 } catch (e) {
                   resolve({ error: e.toString() });
                 }
@@ -541,26 +418,6 @@ module.exports = function register(ctx) {
 	              const found = findMessage(messageId, folderPath);
 	              if (found.error) return { error: found.error };
 	              return msgHdrToHeaderObject(found.msgHdr);
-	            }
-
-	            // Shared shape extraction so getMessageHeaders and
-	            // batchGetMessageHeaders return identical fields.
-	            function msgHdrToHeaderObject(msgHdr) {
-	              return {
-	                id: msgHdr.messageId,
-	                subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "",
-	                author: msgHdr.mime2DecodedAuthor || msgHdr.author || "",
-	                recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients || "",
-	                ccList: msgHdr.ccList || "",
-	                date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-	                tags: getUserTags(msgHdr),
-	                isRead: msgHdr.isRead,
-	                isFlagged: msgHdr.isFlagged,
-	                threadId: msgHdr.threadId ? String(msgHdr.threadId) : null,
-	                references: msgHdr.getStringProperty("references") || "",
-	                inReplyTo: msgHdr.getStringProperty("in-reply-to") || "",
-	                size: typeof msgHdr.messageSize === "number" ? msgHdr.messageSize : null,
-	              };
 	            }
 
 	            /**
@@ -1342,43 +1199,6 @@ module.exports = function register(ctx) {
 	              });
 	            }
 
-	            /**
-	             * Finds a single message header by messageId within a folderPath.
-	             * Returns { msgHdr, folder, db } or { error }.
-	             */
-            function findTrashFolder(folder) {
-              const TRASH_FLAG = 0x00000100;
-              let account = null;
-              try {
-                account = MailServices.accounts.findAccountForServer(folder.server);
-              } catch {
-                return null;
-              }
-              const root = account?.incomingServer?.rootFolder;
-              if (!root) return null;
-
-              let fallback = null;
-              const TRASH_NAMES = ["trash", "deleted items"];
-              const stack = [root];
-              while (stack.length > 0) {
-                const current = stack.pop();
-                try {
-                  if (current && typeof current.getFlag === "function" && current.getFlag(TRASH_FLAG)) {
-                    return current;
-                  }
-                } catch {}
-                if (!fallback && current?.prettyName && TRASH_NAMES.includes(current.prettyName.toLowerCase())) {
-                  fallback = current;
-                }
-                try {
-                  if (current?.hasSubFolders) {
-                    for (const sf of current.subFolders) stack.push(sf);
-                  }
-                } catch {}
-              }
-              return fallback;
-            }
-
             function displayMessage(messageId, folderPath, displayMode) {
               const found = findMessage(messageId, folderPath);
               if (found.error) return found;
@@ -1921,53 +1741,6 @@ module.exports = function register(ctx) {
               }
             }
 
-            /**
-             * Find a special folder by flag bit, searching the account's folder tree.
-             */
-            function findSpecialFolder(root, flagBit) {
-              const search = (folder) => {
-                try {
-                  if (folder.getFlag && folder.getFlag(flagBit)) return folder;
-                } catch {}
-                if (folder.hasSubFolders) {
-                  for (const sub of folder.subFolders) {
-                    const found = search(sub);
-                    if (found) return found;
-                  }
-                }
-                return null;
-              };
-              return search(root);
-            }
-
-            /**
-             * Recursively delete all messages in a folder and its subfolders.
-             * Returns total count of messages deleted.
-             */
-            function deleteAllMessagesRecursive(folder) {
-              let count = 0;
-              try {
-                const db = folder.msgDatabase;
-                if (db) {
-                  const hdrs = [];
-                  for (const hdr of db.enumerateMessages()) hdrs.push(hdr);
-                  if (hdrs.length > 0) {
-                    folder.deleteMessages(hdrs, null, true, false, null, false);
-                    count += hdrs.length;
-                  }
-                }
-              } catch (e) {
-                // Continue traversal; log per-folder failures so partial empties are visible.
-                console.error("thunderbird-mcp: deleteMessages failed for folder", folder?.URI || folder?.name, ":", e);
-              }
-              if (folder.hasSubFolders) {
-                for (const sub of folder.subFolders) {
-                  count += deleteAllMessagesRecursive(sub);
-                }
-              }
-              return count;
-            }
-
             function emptyTrash(accountId) {
               try {
                 const TRASH_FLAG = 0x00000100;
@@ -2073,173 +1846,27 @@ module.exports = function register(ctx) {
               }
             }
 
-            /**
-             * Converts HTML to markdown using DOMParser for structure-preserving
-             * body extraction. Handles headings, links, bold/italic, lists,
-             * blockquotes, code blocks, images, and horizontal rules. Email
-             * tables (usually layout, not data) are flattened to text.
-             * Falls back to stripHtml if DOMParser is unavailable.
-             *
-             * SECURITY: `<a href>` and `<img src>` values come from sender-
-             * controlled HTML, so we strip dangerous schemes (javascript:,
-             * data: non-image, etc.) and defang markdown-syntax injection in
-             * the link text before emitting the final markdown.
-             */
-            function htmlToMarkdown(html) {
-              if (!html) return "";
-              try {
-                const doc = new DOMParser().parseFromString(html, "text/html");
-
-                function walkChildren(node) {
-                  return Array.from(node.childNodes).map(walk).join("");
-                }
-
-                function walk(node) {
-                  if (node.nodeType === 3) { // Text
-                    return node.textContent.replace(/[ \t]+/g, " ");
-                  }
-                  if (node.nodeType !== 1) return "";
-                  const tag = node.tagName.toLowerCase();
-                  const inner = () => walkChildren(node);
-
-                  switch (tag) {
-                    case "script": case "style": case "head": return "";
-                    case "br": return "\n";
-                    case "hr": return "\n\n---\n\n";
-                    case "p": case "div": case "section": case "article":
-                      return "\n\n" + inner().trim() + "\n\n";
-                    case "h1": return "\n\n# " + inner().trim() + "\n\n";
-                    case "h2": return "\n\n## " + inner().trim() + "\n\n";
-                    case "h3": return "\n\n### " + inner().trim() + "\n\n";
-                    case "h4": return "\n\n#### " + inner().trim() + "\n\n";
-                    case "h5": return "\n\n##### " + inner().trim() + "\n\n";
-                    case "h6": return "\n\n###### " + inner().trim() + "\n\n";
-                    case "strong": case "b": {
-                      const t = inner().trim();
-                      return t ? "**" + t + "**" : "";
-                    }
-                    case "em": case "i": {
-                      const t = inner().trim();
-                      return t ? "*" + t + "*" : "";
-                    }
-                    case "a": {
-                      const rawHref = node.getAttribute("href") || "";
-                      const text = inner().trim();
-                      // Skip empty/anchor-only links
-                      if (!text && !rawHref) return "";
-                      // Drop unsafe href schemes (javascript:, data: non-image,
-                      // vbscript:, file:, chrome:, jar:, blob:, ...). Fall back
-                      // to the visible text so the message stays readable.
-                      if (rawHref && !isSafeMarkdownHref(rawHref)) {
-                        return escapeMarkdownLinkText(text || rawHref);
-                      }
-                      if (rawHref && text && text !== rawHref) {
-                        return renderMarkdownLink(text, rawHref);
-                      }
-                      return escapeMarkdownLinkText(text || rawHref);
-                    }
-                    case "img": {
-                      const alt = node.getAttribute("alt") || "";
-                      const rawSrc = node.getAttribute("src") || "";
-                      // Skip tracking pixels (1x1, tiny, or data: without alt)
-                      const w = parseInt(node.getAttribute("width")) || 0;
-                      const h = parseInt(node.getAttribute("height")) || 0;
-                      if ((w > 0 && w <= 3) || (h > 0 && h <= 3)) return "";
-                      if (rawSrc.startsWith("data:") && !alt) return "";
-                      // Allow http(s):, cid:, mailto: (rare), and data:image/*.
-                      // Anything else (javascript:, data: non-image, file:, ...)
-                      // is dropped to alt text.
-                      if (rawSrc && !isSafeImageSrc(rawSrc)) {
-                        return escapeMarkdownLinkText(alt);
-                      }
-                      if (!rawSrc) return escapeMarkdownLinkText(alt);
-                      const safeAlt = escapeMarkdownLinkText(alt);
-                      if (rawSrc.includes(">")) return safeAlt;
-                      const srcForMd = /[()\s]/.test(rawSrc) ? `<${rawSrc}>` : rawSrc;
-                      return `![${safeAlt}](${srcForMd})`;
-                    }
-                    case "code": return "`" + node.textContent + "`";
-                    case "pre": return "\n\n```\n" + node.textContent.trim() + "\n```\n\n";
-                    case "blockquote": {
-                      const text = inner().trim();
-                      return "\n\n" + text.split("\n").map(l => "> " + l).join("\n") + "\n\n";
-                    }
-                    case "ul": case "ol": return "\n" + inner() + "\n";
-                    case "li": {
-                      const parent = node.parentElement;
-                      const isOl = parent && parent.tagName.toLowerCase() === "ol";
-                      return (isOl ? "1. " : "- ") + inner().trim() + "\n";
-                    }
-                    // Tables: extract text with spacing (email tables are usually layout)
-                    case "table": return "\n\n" + inner().trim() + "\n\n";
-                    case "tr": return inner().trim() + "\n";
-                    case "td": case "th": return inner().trim() + " ";
-                    case "thead": case "tbody": case "tfoot": return inner();
-                    default: return inner();
-                  }
-                }
-
-                const body = doc.body || doc.documentElement;
-                let result = walk(body);
-                // Collapse excessive newlines, trim
-                result = result.replace(/\n{3,}/g, "\n\n").trim();
-                return result;
-              } catch {
-                // DOMParser unavailable or parse failure -- fall back to stripHtml
-                return stripHtml(html);
-              }
-            }
-
-            /**
-             * Extracts body from a MIME message in the requested format.
-             * For "text": uses coerceBodyToPlaintext fast path (original behavior).
-             * For "markdown"/"html": walks MIME tree to find raw HTML content.
-             */
-            function extractFormattedBody(aMimeMsg, bodyFormat) {
-              if (bodyFormat === "text") {
-                return { body: wrapUntrustedBody(extractPlainTextBody(aMimeMsg)), bodyIsHtml: false };
-              }
-              // For markdown/html: need raw MIME content, not coerced text
-              const { text, isHtml } = extractBodyContent(aMimeMsg);
-              if (!text) {
-                // MIME tree empty -- try coerce as last resort
-                const fallback = extractPlainTextBody(aMimeMsg);
-                return { body: wrapUntrustedBody(fallback), bodyIsHtml: false };
-              }
-              if (!isHtml) return { body: wrapUntrustedBody(text), bodyIsHtml: false };
-              if (bodyFormat === "html") return { body: text, bodyIsHtml: true };
-              // Default: markdown
-              return { body: wrapUntrustedBody(htmlToMarkdown(text)), bodyIsHtml: false };
-            }
-
   Object.assign(ctx, {
-    exportsDir,
-    buildExportFilename,
-    exportMailbox,
-    glodaBodySearch,
-    searchMessages,
-    getMessageHeaders,
-    msgHdrToHeaderObject,
-    getSenderHistory,
-    searchAttachments,
-    searchByThread,
-    batchGetMessageHeaders,
-    getMessage,
-    findTrashFolder,
-    displayMessage,
-    refreshFolder,
-    getRecentMessages,
-    deleteMessages,
-    updateMessage,
-    createFolder,
-    renameFolder,
-    deleteFolder,
-    findSpecialFolder,
-    deleteAllMessagesRecursive,
-    emptyTrash,
-    emptyJunk,
-    moveFolder,
-    htmlToMarkdown,
-    extractFormattedBody,
+    mailService: {
+      searchMessages,
+      getMessage,
+      getMessageHeaders,
+      getRecentMessages,
+      batchGetMessageHeaders,
+      searchByThread,
+      searchAttachments,
+      getSenderHistory,
+      displayMessage,
+      updateMessage,
+      deleteMessages,
+      createFolder,
+      renameFolder,
+      deleteFolder,
+      moveFolder,
+      emptyTrash,
+      emptyJunk,
+      refreshFolder,
+      exportMailbox,
+    },
   });
 };
