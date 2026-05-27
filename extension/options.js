@@ -26,9 +26,32 @@ const stableAuthTokenStatus = document.getElementById("stableAuthTokenStatus");
 
 let currentAccounts = [];
 let currentTools = [];
+let getMessagesLimitInput = null;
+let getMessagesLimitStatus = null;
 
 // CRUD labels for sub-group headers
 const CRUD_LABELS = { read: "Read", create: "Create", update: "Update", delete: "Delete" };
+
+function validateGetMessagesLimitInput() {
+  if (!getMessagesLimitInput) return undefined;
+  const min = Number(getMessagesLimitInput.dataset.min || "1");
+  const max = Number(getMessagesLimitInput.dataset.max || "20");
+  const rawValue = getMessagesLimitInput.value.trim();
+  const value = Number(rawValue);
+  const valid = /^\d+$/.test(rawValue) && Number.isInteger(value) && value >= min && value <= max;
+  if (!valid) {
+    getMessagesLimitInput.setAttribute("aria-invalid", "true");
+    if (getMessagesLimitStatus) {
+      getMessagesLimitStatus.textContent = `Enter an integer from ${min} to ${max}.`;
+    }
+    return null;
+  }
+  getMessagesLimitInput.removeAttribute("aria-invalid");
+  if (getMessagesLimitStatus) {
+    getMessagesLimitStatus.textContent = "";
+  }
+  return value;
+}
 
 async function loadServerInfo() {
   try {
@@ -301,6 +324,8 @@ async function loadToolAccess() {
     }
 
     toolList.innerHTML = "";
+    getMessagesLimitInput = null;
+    getMessagesLimitStatus = null;
 
     // Tools arrive pre-sorted by group then CRUD order from the server.
     // Build grouped structure from tool metadata.
@@ -331,6 +356,9 @@ async function loadToolAccess() {
       }
 
       const li = document.createElement("li");
+      if (tool.name === "getMessages") {
+        li.className = "tool-with-option";
+      }
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.id = "tool-" + tool.name;
@@ -341,6 +369,15 @@ async function loadToolAccess() {
       }
       checkbox.addEventListener("change", () => {
         saveToolsStatus.textContent = "";
+        if (tool.name === "getMessages" && getMessagesLimitInput) {
+          getMessagesLimitInput.disabled = !checkbox.checked;
+          if (checkbox.checked) {
+            validateGetMessagesLimitInput();
+          } else {
+            getMessagesLimitInput.removeAttribute("aria-invalid");
+            if (getMessagesLimitStatus) getMessagesLimitStatus.textContent = "";
+          }
+        }
       });
 
       const label = document.createElement("label");
@@ -355,6 +392,40 @@ async function loadToolAccess() {
 
       li.appendChild(checkbox);
       li.appendChild(label);
+      if (tool.name === "getMessages") {
+        const option = document.createElement("div");
+        option.className = "tool-option";
+
+        const limitLabel = document.createElement("label");
+        limitLabel.htmlFor = "getMessagesLimit";
+        limitLabel.textContent = "Max messages per call";
+
+        getMessagesLimitInput = document.createElement("input");
+        getMessagesLimitInput.type = "text";
+        getMessagesLimitInput.inputMode = "numeric";
+        getMessagesLimitInput.id = "getMessagesLimit";
+        getMessagesLimitInput.dataset.min = String(tool.getMessagesLimitMin || data.getMessagesLimitMin || 1);
+        getMessagesLimitInput.dataset.max = String(tool.getMessagesLimitMax || data.getMessagesLimitMax || 20);
+        getMessagesLimitInput.value = String(tool.getMessagesLimit || data.getMessagesLimit || 10);
+        getMessagesLimitInput.disabled = !checkbox.checked;
+        getMessagesLimitInput.addEventListener("input", () => {
+          saveToolsStatus.textContent = "";
+          validateGetMessagesLimitInput();
+        });
+
+        const rangeNote = document.createElement("span");
+        rangeNote.className = "range-note";
+        rangeNote.textContent = `1-${getMessagesLimitInput.dataset.max}`;
+
+        getMessagesLimitStatus = document.createElement("div");
+        getMessagesLimitStatus.className = "tool-limit-error";
+
+        option.appendChild(limitLabel);
+        option.appendChild(getMessagesLimitInput);
+        option.appendChild(rangeNote);
+        li.appendChild(option);
+        li.appendChild(getMessagesLimitStatus);
+      }
       toolList.appendChild(li);
     }
 
@@ -380,9 +451,19 @@ saveToolsBtn.addEventListener("click", async () => {
       disabled.push(cb.value);
     }
   }
+  let getMessagesLimit;
+  if (getMessagesLimitInput) {
+    getMessagesLimit = validateGetMessagesLimitInput();
+    if (getMessagesLimit === null) {
+      saveToolsStatus.textContent = "Fix the highlighted getMessages limit before saving.";
+      saveToolsStatus.className = "save-status error";
+      saveToolsBtn.disabled = false;
+      return;
+    }
+  }
 
   try {
-    const result = await browser.mcpServer.setToolAccess(disabled);
+    const result = await browser.mcpServer.setToolAccess(disabled, getMessagesLimit);
     if (result.error) {
       saveToolsStatus.textContent = result.error;
       saveToolsStatus.className = "save-status error";
